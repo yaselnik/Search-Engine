@@ -1,8 +1,6 @@
 package domain
 
-/*
- * Represents a lexical unit extracted from the source text.
- */
+// Represents a lexical unit extracted from the source text.
 type Token struct {
 	Value    string // Normalized value of token
 	Origin   string // Original substring from the source text before any normalization.

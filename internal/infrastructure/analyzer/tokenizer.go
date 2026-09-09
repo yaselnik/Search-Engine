@@ -9,9 +9,7 @@ import (
 // \p{L} matches any Unicode letter, \p{N} matches any Unicode number.
 var wordRegex = regexp.MustCompile(`[\p{L}\p{N}]+`)
 
-/*
- * Splits the input text into tokens based on wordRegex expresion.
- */
+// Splits the input text into tokens based on wordRegex expresion.
 func RegexpTokenize (text string) []domain.Token {
 	if text == "" {
 		return []domain.Token{}
