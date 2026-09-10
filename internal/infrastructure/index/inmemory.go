@@ -6,6 +6,7 @@ import (
 
 	"github.com/yaselnik/Search-Engine/internal/domain"
 )
+
 // Compile-time check to ensure InMemoryIndex implements domain.Index.
 var _ domain.Index = (*InMemoryIndex)(nil)
 
@@ -15,7 +16,7 @@ var _ domain.Index = (*InMemoryIndex)(nil)
 // Optimization: It maintains a reverse mapping (docTokens) to ensure that
 // document removal or update operates in O(K) time, where K is the number of
 // unique tokens in the document, rather than scanning the entire index.
- type InMemoryIndex struct {
+type InMemoryIndex struct {
 	mu        sync.RWMutex
 	index     map[string][]domain.Posting
 	docTokens map[domain.DocID]map[string]struct{}
@@ -30,7 +31,7 @@ func NewInMemoryIndex() *InMemoryIndex {
 
 // Adds the postings for a given document.
 // If the document already exists, its old postings are removed before adding the new ones.
- func (r *InMemoryIndex) Add(docID domain.DocID, tokens []domain.Token) error {
+func (r *InMemoryIndex) Add(docID domain.DocID, tokens []domain.Token) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -61,7 +62,6 @@ func NewInMemoryIndex() *InMemoryIndex {
 
 	return nil
 }
-
 
 // Retrieves the list of postings for a specific token.
 // Returns nil if the token is not found in the index.
@@ -98,7 +98,7 @@ func (r *InMemoryIndex) removeUnsafe(id domain.DocID) error {
 		postings := r.index[token]
 		for i, posting := range postings {
 			if posting.DocID == id {
-				r.index[token] = slices.Delete(postings, i, i + 1)
+				r.index[token] = slices.Delete(postings, i, i+1)
 				break
 			}
 		}
