@@ -1,8 +1,10 @@
 package analyzer
 
 import (
-	"github.com/yaselnik/Search-Engine/internal/domain"
 	"regexp"
+	"strings"
+
+	"github.com/yaselnik/Search-Engine/internal/domain"
 )
 
 // \p{L} matches any Unicode letter, \p{N} matches any Unicode number.
@@ -28,7 +30,7 @@ func RegexpTokenize(text string) []domain.Token {
 		wordPos++
 
 		result = append(result, domain.Token{
-			Value:    token,
+			Value:    strings.ToLower(token), // Note: While analyzer pipeline are not implemented
 			Origin:   token,
 			Position: wordPos,
 			Offset:   uint32(match[0]),

@@ -21,17 +21,17 @@ func TestRegexpTokenize(t *testing.T) {
 			name:  "hello world",
 			input: "Hello World",
 			expected: []domain.Token{
-				{Value: "Hello", Origin: "Hello", Position: 1, Offset: 0, Length: 5},
-				{Value: "World", Origin: "World", Position: 2, Offset: 6, Length: 5},
+				{Value: "hello", Origin: "Hello", Position: 1, Offset: 0, Length: 5},
+				{Value: "world", Origin: "World", Position: 2, Offset: 6, Length: 5},
 			},
 		},
 		{
 			name:  "text with punctuation",
 			input: "Hello, World! How are you?",
 			expected: []domain.Token{
-				{Value: "Hello", Origin: "Hello", Position: 1, Offset: 0, Length: 5},
-				{Value: "World", Origin: "World", Position: 2, Offset: 7, Length: 5},
-				{Value: "How", Origin: "How", Position: 3, Offset: 14, Length: 3},
+				{Value: "hello", Origin: "Hello", Position: 1, Offset: 0, Length: 5},
+				{Value: "world", Origin: "World", Position: 2, Offset: 7, Length: 5},
+				{Value: "how", Origin: "How", Position: 3, Offset: 14, Length: 3},
 				{Value: "are", Origin: "are", Position: 4, Offset: 18, Length: 3},
 				{Value: "you", Origin: "you", Position: 5, Offset: 22, Length: 3},
 			},
@@ -40,7 +40,7 @@ func TestRegexpTokenize(t *testing.T) {
 			name:  "cyrillic text",
 			input: "Привет, мир!",
 			expected: []domain.Token{
-				{Value: "Привет", Origin: "Привет", Position: 1, Offset: 0, Length: 12},
+				{Value: "привет", Origin: "Привет", Position: 1, Offset: 0, Length: 12},
 				{Value: "мир", Origin: "мир", Position: 2, Offset: 14, Length: 6},
 			},
 		},
@@ -48,7 +48,7 @@ func TestRegexpTokenize(t *testing.T) {
 			name:  "mixed words and numbers",
 			input: "Go 1.22 is awesome!",
 			expected: []domain.Token{
-				{Value: "Go", Origin: "Go", Position: 1, Offset: 0, Length: 2},
+				{Value: "go", Origin: "Go", Position: 1, Offset: 0, Length: 2},
 				{Value: "1", Origin: "1", Position: 2, Offset: 3, Length: 1},
 				{Value: "22", Origin: "22", Position: 3, Offset: 5, Length: 2},
 				{Value: "is", Origin: "is", Position: 4, Offset: 8, Length: 2},
@@ -64,9 +64,9 @@ func TestRegexpTokenize(t *testing.T) {
 			name:  "mixed languages",
 			input: "Hello world! Привет мир!",
 			expected: []domain.Token{
-				{Value: "Hello", Origin: "Hello", Position: 1, Offset: 0, Length: 5},
+				{Value: "hello", Origin: "Hello", Position: 1, Offset: 0, Length: 5},
 				{Value: "world", Origin: "world", Position: 2, Offset: 6, Length: 5},
-				{Value: "Привет", Origin: "Привет", Position: 3, Offset: 13, Length: 12},
+				{Value: "привет", Origin: "Привет", Position: 3, Offset: 13, Length: 12},
 				{Value: "мир", Origin: "мир", Position: 4, Offset: 26, Length: 6},
 			},
 		},
