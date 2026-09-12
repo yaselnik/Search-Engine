@@ -20,7 +20,7 @@ func TestInMemoryIndex_Add(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	postings, err := idx.GetPostings(domain.Token{Value: "hello"})
+	postings, err := idx.GetPostings("hello")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -37,7 +37,7 @@ func TestInMemoryIndex_Add(t *testing.T) {
 		t.Errorf("expected 2 positions, got %d", len(postings[0].Positions))
 	}
 
-	postings, _ = idx.GetPostings(domain.Token{Value: "world"})
+	postings, _ = idx.GetPostings("world")
 	if len(postings) != 1 || postings[0].Frequency != 1 {
 		t.Errorf("unexpected postings for 'world': %+v", postings)
 	}
@@ -46,7 +46,7 @@ func TestInMemoryIndex_Add(t *testing.T) {
 func TestInMemoryIndex_GetPostings_NotFound(t *testing.T) {
 	idx := NewInMemoryIndex()
 
-	postings, err := idx.GetPostings(domain.Token{Value: "nonexistent"})
+	postings, err := idx.GetPostings("nonexistent")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -65,12 +65,12 @@ func TestInMemoryIndex_Remove(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	postings, _ := idx.GetPostings(domain.Token{Value: "hello"})
+	postings, _ := idx.GetPostings("hello")
 	if len(postings) != 1 || postings[0].DocID != 2 {
 		t.Errorf("expected only doc 2 for 'hello', got %+v", postings)
 	}
 
-	postings, _ = idx.GetPostings(domain.Token{Value: "world"})
+	postings, _ = idx.GetPostings("world")
 	if postings != nil {
 		t.Errorf("expected nil for 'world' after removal, got %+v", postings)
 	}
@@ -91,12 +91,12 @@ func TestInMemoryIndex_Add_Overwrite(t *testing.T) {
 
 	idx.Add(1, []domain.Token{{Value: "world", Position: 1}})
 
-	postings, _ := idx.GetPostings(domain.Token{Value: "hello"})
+	postings, _ := idx.GetPostings("hello")
 	if postings != nil {
 		t.Errorf("expected 'hello' to be removed after re-index, got %+v", postings)
 	}
 
-	postings, _ = idx.GetPostings(domain.Token{Value: "world"})
+	postings, _ = idx.GetPostings("world")
 	if len(postings) != 1 || postings[0].DocID != 1 {
 		t.Errorf("expected 'world' in doc 1, got %+v", postings)
 	}
@@ -122,13 +122,13 @@ func TestInMemoryIndex_ConcurrentAccess(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			_, _ = idx.GetPostings(domain.Token{Value: "token"})
+			_, _ = idx.GetPostings("token")
 		}()
 	}
 
 	wg.Wait()
 
-	postings, _ := idx.GetPostings(domain.Token{Value: "token"})
+	postings, _ := idx.GetPostings("token")
 	if len(postings) != 100 {
 		t.Errorf("expected 100 postings, got %d", len(postings))
 	}

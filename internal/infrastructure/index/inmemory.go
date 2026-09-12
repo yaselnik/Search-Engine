@@ -20,12 +20,17 @@ type InMemoryIndex struct {
 	mu        sync.RWMutex
 	index     map[string][]domain.Posting
 	docTokens map[domain.DocID]map[string]struct{}
+
+	docLengths  map[domain.DocID]uint32 // Maps docID's to their length in tokens
+	docCount    uint64
+	totalLength uint64
 }
 
 func NewInMemoryIndex() *InMemoryIndex {
 	return &InMemoryIndex{
-		index:     make(map[string][]domain.Posting),
-		docTokens: make(map[domain.DocID]map[string]struct{}),
+		index:      make(map[string][]domain.Posting),
+		docTokens:  make(map[domain.DocID]map[string]struct{}),
+		docLengths: make(map[domain.DocID]uint32),
 	}
 }
 
@@ -36,6 +41,11 @@ func (r *InMemoryIndex) Add(docID domain.DocID, tokens []domain.Token) error {
 	defer r.mu.Unlock()
 
 	r.removeUnsafe(docID)
+
+	docLen := uint32(len(tokens))
+	r.docLengths[docID] = docLen
+	r.totalLength += uint64(docLen)
+	r.docCount++
 
 	tokenStats := make(map[string]*domain.Posting)
 	r.docTokens[docID] = make(map[string]struct{})
@@ -65,11 +75,11 @@ func (r *InMemoryIndex) Add(docID domain.DocID, tokens []domain.Token) error {
 
 // Retrieves the list of postings for a specific token.
 // Returns nil if the token is not found in the index.
-func (r *InMemoryIndex) GetPostings(token domain.Token) ([]domain.Posting, error) {
+func (r *InMemoryIndex) GetPostings(term string) ([]domain.Posting, error) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
-	post, exist := r.index[token.Value]
+	post, exist := r.index[term]
 	if !exist {
 		return nil, nil
 	}
@@ -111,4 +121,30 @@ func (r *InMemoryIndex) removeUnsafe(id domain.DocID) error {
 	delete(r.docTokens, id)
 
 	return nil
+}
+
+func (r *InMemoryIndex) GetDocCount() uint64 {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	return r.docCount
+}
+
+func (r *InMemoryIndex) GetAvgDocLength() float64 {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	if r.docCount == 0 {
+		return 0
+	}
+
+	return float64(r.totalLength) / float64(r.docCount)
+}
+
+// Returns document length in tokens
+func (r *InMemoryIndex) GetDocLength(docID domain.DocID) float64 {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	return float64(r.docLengths[docID])
 }
