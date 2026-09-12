@@ -17,9 +17,12 @@ func (m *mockStorage) GetAll(ctx context.Context) ([]domain.Document, error) {
 	return m.docs, m.err
 }
 func (m *mockStorage) Add(ctx context.Context, doc domain.Document) error { return nil }
-func (m *mockStorage) GetDocumentByID(ctx context.Context, id domain.DocID) (domain.Document, error) { return domain.Document{}, nil }
-func (m *mockStorage) Delete(ctx context.Context, id domain.DocID) error { return nil }
+func (m *mockStorage) GetDocumentByID(ctx context.Context, id domain.DocID) (domain.Document, error) {
+	return domain.Document{}, nil
+}
+func (m *mockStorage) Delete(ctx context.Context, id domain.DocID) error         { return nil }
 func (m *mockStorage) Exists(ctx context.Context, id domain.DocID) (bool, error) { return false, nil }
+
 type mockIndex struct {
 	addCalled bool
 	err       error
@@ -30,11 +33,10 @@ func (m *mockIndex) Add(docId domain.DocID, tokens []domain.Token) error {
 	return m.err
 }
 func (m *mockIndex) GetPostings(term string) ([]domain.Posting, error) { return nil, nil }
-func (m *mockIndex) Remove(id domain.DocID) error { return nil }
-func (m *mockIndex) GetDocCount() uint64 { return 0 }
-func (m *mockIndex) GetAvgDocLength() float64 { return 0. }
-func (m *mockIndex) GetDocLength(docID domain.DocID) float64 { return 0. }
-
+func (m *mockIndex) Remove(id domain.DocID) error                      { return nil }
+func (m *mockIndex) GetDocCount() uint64                               { return 0 }
+func (m *mockIndex) GetAvgDocLength() float64                          { return 0. }
+func (m *mockIndex) GetDocLength(docID domain.DocID) float64           { return 0. }
 
 func TestIndexer_IndexAll(t *testing.T) {
 	t.Parallel()

@@ -14,5 +14,7 @@ type Index interface {
 
 	GetDocCount() uint64
 	GetAvgDocLength() float64
-    GetDocLength(docID DocID) float64
+
+	// Returns document length in tokens
+	GetDocLength(docID DocID) float64
 }

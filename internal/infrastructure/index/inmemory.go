@@ -141,6 +141,7 @@ func (r *InMemoryIndex) GetAvgDocLength() float64 {
 	return float64(r.totalLength) / float64(r.docCount)
 }
 
+// Returns document length in tokens
 func (r *InMemoryIndex) GetDocLength(docID domain.DocID) float64 {
 	r.mu.RLock()
 	defer r.mu.RUnlock()

@@ -138,7 +138,7 @@ func BenchmarkInMemoryIndex_Add(b *testing.B) {
 	idx := NewInMemoryIndex()
 	tokens := make([]domain.Token, 100)
 	for i := 0; i < 100; i++ {
-		tokens[i] = domain.Token{Value:"token", Position: uint32(i)}
+		tokens[i] = domain.Token{Value: "token", Position: uint32(i)}
 	}
 
 	b.ResetTimer()
