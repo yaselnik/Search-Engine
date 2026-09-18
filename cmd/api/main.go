@@ -1,28 +1,29 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"flag"
-	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
-	"strings"
 	"syscall"
+	"time"
 
+	httpDelivery "github.com/yaselnik/Search-Engine/internal/delivery/http"
 	"github.com/yaselnik/Search-Engine/internal/infrastructure/analyzer"
 	"github.com/yaselnik/Search-Engine/internal/infrastructure/index"
 	"github.com/yaselnik/Search-Engine/internal/infrastructure/loader"
 	"github.com/yaselnik/Search-Engine/internal/infrastructure/ranker"
 	"github.com/yaselnik/Search-Engine/internal/infrastructure/storage"
-	usecase_idx "github.com/yaselnik/Search-Engine/internal/usecase/indexer"
-	usecase_search "github.com/yaselnik/Search-Engine/internal/usecase/searcher"
+	"github.com/yaselnik/Search-Engine/internal/usecase/indexer"
+	"github.com/yaselnik/Search-Engine/internal/usecase/searcher"
 )
 
 func main() {
 	dataPath := flag.String("data", "./data", "path to directory with documents")
 	logLevel := flag.String("log-level", "info", "log level (debug, info, warn, error)")
+	httpAddr := flag.String("addr", ":8080", "http server address")
 	flag.Parse()
 
 	var level slog.Level
@@ -51,65 +52,50 @@ func main() {
 	}
 	logger.Info("documents loaded successfully", "count", loaded)
 
-	indexerUC := usecase_idx.NewIndexer(docStorage, idx, analyzer.RegexpTokenize, logger)
+	indexerUC := indexer.NewIndexer(docStorage, idx, analyzer.RegexpTokenize, logger)
 	if err := indexerUC.IndexAll(ctx); err != nil {
 		logger.Error("indexing failed, exiting", "error", err)
 		os.Exit(1)
 	}
 
 	bm25 := ranker.NewBM25()
-	searcher := usecase_search.NewSearcher(docStorage, idx, analyzer.RegexpTokenize, bm25)
+	searcher := searcher.NewSearcher(docStorage, idx, analyzer.RegexpTokenize, bm25)
 
-	logger.Info("search engine is ready. Type your query or 'exit' to quit.")
+	handler := httpDelivery.NewHandler(searcher, docStorage, logger)
 
-	scanner := bufio.NewScanner(os.Stdin)
-	for {
-		fmt.Print("\nsearch> ")
+	mux := http.NewServeMux()
 
-		if ctx.Err() != nil {
-			fmt.Println("\nShutting down gracefully...")
-			break
-		}
+	mux.HandleFunc("GET /api/search", handler.Search)
+	mux.HandleFunc("GET /api/documents/{id}", handler.GetDocument)
 
-		if !scanner.Scan() {
-			break
-		}
+	appHandler := httpDelivery.LoggingMiddleware(logger, mux)
 
-		query := strings.TrimSpace(scanner.Text())
-		if query == "" {
-			continue
-		}
+	server := &http.Server{
+		Addr:    *httpAddr,
+		Handler: appHandler,
 
-		lowerQuery := strings.ToLower(query)
-		if lowerQuery == "exit" || lowerQuery == "quit" {
-			fmt.Println("Goodbye!")
-			break
-		}
-
-		results, err := searcher.Search(ctx, query, 5)
-		if err != nil {
-			logger.Error("search failed", "error", err)
-			fmt.Println("An error occurred during search.")
-			continue
-		}
-
-		if len(results) == 0 {
-			fmt.Println("No results found.")
-			continue
-		}
-
-		fmt.Printf("\nFound %d result(s):\n", len(results))
-		for i, res := range results {
-			fmt.Printf("  [%d] Score: %.4f | Title: %s\n", i+1, res.Score, res.Document.Title)
-			fmt.Printf("      Source: %s\n", res.Document.URL)
-			fmt.Printf("      Snippet: %s\n", res.Snippet)
-			fmt.Println(strings.Repeat("-", 80))
-		}
+		ReadTimeout:  5 * time.Second,
+		WriteTimeout: 10 * time.Second,
+		IdleTimeout:  120 * time.Second,
 	}
 
-	if err := scanner.Err(); err != nil {
-		logger.Error("error reading input", "error", err)
-	}
+	go func() {
+		logger.Info("http server started", "addr", *httpAddr)
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			logger.Error("http server failed", "error", err)
+			cancel()
+		}
+	}()
 
+	<-ctx.Done()
 	logger.Info("shutting down gracefully...")
+
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer shutdownCancel()
+
+	if err := server.Shutdown(shutdownCtx); err != nil {
+		logger.Error("http server shutdown failed", "error", err)
+	}
+
+	logger.Info("search engine stopped")
 }
