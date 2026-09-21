@@ -12,16 +12,16 @@ import (
 // Indexer orchestrates the process of fetching documents from storage,
 // tokenizing their content, and adding them to the index.
 type Indexer struct {
-	storage   domain.DocumentStorage
-	index     domain.Index
-	tokenizer domain.Tokenizer
-	logger    *slog.Logger
+	storage  domain.DocumentStorage
+	index    domain.Index
+	analyzer domain.Analyzer
+	logger   *slog.Logger
 }
 
 func NewIndexer(
 	storage domain.DocumentStorage,
 	index domain.Index,
-	tokenizer domain.Tokenizer,
+	analyzer domain.Analyzer,
 	logger *slog.Logger,
 ) *Indexer {
 	if logger == nil {
@@ -29,10 +29,10 @@ func NewIndexer(
 	}
 
 	return &Indexer{
-		storage:   storage,
-		index:     index,
-		tokenizer: tokenizer,
-		logger:    logger.With("component", "indexer"),
+		storage:  storage,
+		index:    index,
+		analyzer: analyzer,
+		logger:   logger.With("component", "indexer"),
 	}
 }
 
@@ -66,7 +66,7 @@ func (i *Indexer) IndexAll(ctx context.Context) error {
 
 // IndexDocument tokenizes a single document's content and adds it to the index.
 func (i *Indexer) IndexDocument(ctx context.Context, doc domain.Document) error {
-	tokens := i.tokenizer(doc.Content)
+	tokens := i.analyzer.Analyze(doc.Content)
 
 	if err := i.index.Add(doc.ID, tokens); err != nil {
 		return fmt.Errorf("indexer: add tokens to index for doc %d: %w", doc.ID, err)

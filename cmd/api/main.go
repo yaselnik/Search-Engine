@@ -43,6 +43,7 @@ func main() {
 
 	idx := index.NewInMemoryIndex()
 	docStorage := storage.NewInMemoryStorage()
+	analyzer := analyzer.NewAnalyzer(analyzer.RegexpTokenize, analyzer.LowercaseFilter{})
 
 	source := loader.NewLoader(*dataPath, []string{".txt", ".md"}, docStorage, logger)
 	loaded, err := source.Load(ctx)
@@ -52,14 +53,14 @@ func main() {
 	}
 	logger.Info("documents loaded successfully", "count", loaded)
 
-	indexerUC := indexer.NewIndexer(docStorage, idx, analyzer.RegexpTokenize, logger)
+	indexerUC := indexer.NewIndexer(docStorage, idx, analyzer, logger)
 	if err := indexerUC.IndexAll(ctx); err != nil {
 		logger.Error("indexing failed, exiting", "error", err)
 		os.Exit(1)
 	}
 
 	bm25 := ranker.NewBM25()
-	searcher := searcher.NewSearcher(docStorage, idx, analyzer.RegexpTokenize, bm25)
+	searcher := searcher.NewSearcher(docStorage, idx, analyzer, bm25)
 
 	handler := httpDelivery.NewHandler(searcher, docStorage, logger)
 
