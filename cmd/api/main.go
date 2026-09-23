@@ -12,6 +12,7 @@ import (
 
 	httpDelivery "github.com/yaselnik/Search-Engine/internal/delivery/http"
 	"github.com/yaselnik/Search-Engine/internal/infrastructure/analyzer"
+	"github.com/yaselnik/Search-Engine/internal/infrastructure/analyzer/stemmer"
 	"github.com/yaselnik/Search-Engine/internal/infrastructure/index"
 	"github.com/yaselnik/Search-Engine/internal/infrastructure/loader"
 	"github.com/yaselnik/Search-Engine/internal/infrastructure/ranker"
@@ -43,7 +44,10 @@ func main() {
 
 	idx := index.NewInMemoryIndex()
 	docStorage := storage.NewInMemoryStorage()
-	analyzer := analyzer.NewAnalyzer(analyzer.RegexpTokenize, analyzer.LowercaseFilter{})
+
+	engStemmer := stemmer.NewEngStemmer()
+	stemmer := stemmer.NewMultiLanguageStemmer(engStemmer, nil)
+	analyzer := analyzer.NewAnalyzer(analyzer.RegexpTokenize, analyzer.LowercaseFilter{}, stemmer)
 
 	source := loader.NewLoader(*dataPath, []string{".txt", ".md"}, docStorage, logger)
 	loaded, err := source.Load(ctx)
