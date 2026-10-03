@@ -12,6 +12,7 @@ import (
 
 	httpDelivery "github.com/yaselnik/Search-Engine/internal/delivery/http"
 	"github.com/yaselnik/Search-Engine/internal/infrastructure/analyzer"
+	"github.com/yaselnik/Search-Engine/internal/infrastructure/analyzer/stemmer"
 	"github.com/yaselnik/Search-Engine/internal/infrastructure/index"
 	"github.com/yaselnik/Search-Engine/internal/infrastructure/loader"
 	"github.com/yaselnik/Search-Engine/internal/infrastructure/ranker"
@@ -44,6 +45,10 @@ func main() {
 	idx := index.NewInMemoryIndex()
 	docStorage := storage.NewInMemoryStorage()
 
+	engStemmer := stemmer.NewEngStemmer()
+	stemmer := stemmer.NewMultiLanguageStemmer(engStemmer, nil)
+	analyzer := analyzer.NewAnalyzer(analyzer.RegexpTokenize, analyzer.LowercaseFilter{}, stemmer)
+
 	source := loader.NewLoader(*dataPath, []string{".txt", ".md"}, docStorage, logger)
 	loaded, err := source.Load(ctx)
 	if err != nil {
@@ -52,14 +57,14 @@ func main() {
 	}
 	logger.Info("documents loaded successfully", "count", loaded)
 
-	indexerUC := indexer.NewIndexer(docStorage, idx, analyzer.RegexpTokenize, logger)
+	indexerUC := indexer.NewIndexer(docStorage, idx, analyzer, logger)
 	if err := indexerUC.IndexAll(ctx); err != nil {
 		logger.Error("indexing failed, exiting", "error", err)
 		os.Exit(1)
 	}
 
 	bm25 := ranker.NewBM25()
-	searcher := searcher.NewSearcher(docStorage, idx, analyzer.RegexpTokenize, bm25)
+	searcher := searcher.NewSearcher(docStorage, idx, analyzer, bm25)
 
 	handler := httpDelivery.NewHandler(searcher, docStorage, logger)
 

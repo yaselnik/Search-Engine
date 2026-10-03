@@ -2,10 +2,12 @@ package analyzer
 
 import (
 	"regexp"
-	"strings"
 
 	"github.com/yaselnik/Search-Engine/internal/domain"
 )
+
+// Defines the contract for functions that split text into tokens.
+type Tokenizer func(text string) []domain.Token
 
 // \p{L} matches any Unicode letter, \p{N} matches any Unicode number.
 var wordRegex = regexp.MustCompile(`[\p{L}\p{N}]+`)
@@ -30,7 +32,7 @@ func RegexpTokenize(text string) []domain.Token {
 		wordPos++
 
 		result = append(result, domain.Token{
-			Value:    strings.ToLower(token), // Note: While analyzer pipeline are not implemented
+			Value:    token,
 			Origin:   token,
 			Position: wordPos,
 			Offset:   uint32(match[0]),

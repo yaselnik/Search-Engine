@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/yaselnik/Search-Engine/internal/domain"
+	"github.com/yaselnik/Search-Engine/internal/infrastructure/analyzer"
 )
 
 type mockStorage struct {
@@ -38,6 +39,14 @@ func (m *mockIndex) GetDocCount() uint64                               { return 
 func (m *mockIndex) GetAvgDocLength() float64                          { return 0. }
 func (m *mockIndex) GetDocLength(docID domain.DocID) float64           { return 0. }
 
+type mockAnalyzer struct {
+	tokenizer analyzer.Tokenizer
+}
+
+func (m *mockAnalyzer) Analyze(text string) []domain.Token {
+	return m.tokenizer(text)
+}
+
 func TestIndexer_IndexAll(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -45,6 +54,7 @@ func TestIndexer_IndexAll(t *testing.T) {
 	dummyTokenizer := func(text string) []domain.Token {
 		return []domain.Token{{Value: "test", Origin: "test"}}
 	}
+	analyzer := mockAnalyzer{tokenizer: dummyTokenizer}
 
 	t.Run("successful indexing", func(t *testing.T) {
 		store := &mockStorage{
@@ -54,7 +64,8 @@ func TestIndexer_IndexAll(t *testing.T) {
 			},
 		}
 		idx := &mockIndex{}
-		ix := NewIndexer(store, idx, dummyTokenizer, nil)
+
+		ix := NewIndexer(store, idx, &analyzer, nil)
 
 		err := ix.IndexAll(ctx)
 		if err != nil {
@@ -67,7 +78,7 @@ func TestIndexer_IndexAll(t *testing.T) {
 
 	t.Run("storage error", func(t *testing.T) {
 		store := &mockStorage{err: errors.New("db error")}
-		ix := NewIndexer(store, &mockIndex{}, dummyTokenizer, nil)
+		ix := NewIndexer(store, &mockIndex{}, &analyzer, nil)
 
 		err := ix.IndexAll(ctx)
 		if err == nil {
@@ -80,7 +91,7 @@ func TestIndexer_IndexAll(t *testing.T) {
 		cancel()
 
 		store := &mockStorage{docs: []domain.Document{{ID: 1}}}
-		ix := NewIndexer(store, &mockIndex{}, dummyTokenizer, nil)
+		ix := NewIndexer(store, &mockIndex{}, &analyzer, nil)
 
 		err := ix.IndexAll(ctx)
 		if err == nil {

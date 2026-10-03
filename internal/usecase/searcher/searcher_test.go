@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/yaselnik/Search-Engine/internal/domain"
+	"github.com/yaselnik/Search-Engine/internal/infrastructure/analyzer"
 	"github.com/yaselnik/Search-Engine/internal/infrastructure/ranker"
 )
 
@@ -32,6 +33,14 @@ func (m *mockStorage) GetAll(ctx context.Context) ([]domain.Document, error)    
 func (m *mockStorage) Delete(ctx context.Context, id domain.DocID) error         { return nil }
 func (m *mockStorage) Exists(ctx context.Context, id domain.DocID) (bool, error) { return false, nil }
 
+type mockAnalyzer struct {
+	tokenizer analyzer.Tokenizer
+}
+
+func (m *mockAnalyzer) Analyze(text string) []domain.Token {
+	return m.tokenizer(text)
+}
+
 func mockTokenizer(text string) []domain.Token {
 	return []domain.Token{{Value: text}}
 }
@@ -57,7 +66,9 @@ func TestSearcher_Search(t *testing.T) {
 		},
 	}
 
-	searcher := NewSearcher(storage, idx, mockTokenizer, ranker.NewBM25())
+	analyzer := mockAnalyzer{tokenizer: mockTokenizer}
+
+	searcher := NewSearcher(storage, idx, &analyzer, ranker.NewBM25())
 
 	t.Run("successful search with ranking", func(t *testing.T) {
 		results, err := searcher.Search(context.Background(), "golang", 2)

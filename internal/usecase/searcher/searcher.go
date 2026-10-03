@@ -8,22 +8,22 @@ import (
 	"github.com/yaselnik/Search-Engine/internal/domain"
 )
 
-// Orchestrates the search process: it tokenizes the query,
+// Orchestrates the search process: it analyzes the query,
 // retrieves postings from the index, ranks the results, and enriches
 // them with full document data and snippets.
 type Searcher struct {
-	storage   domain.DocumentStorage
-	index     domain.Index
-	tokenizer domain.Tokenizer
-	ranker    domain.Ranker
+	storage  domain.DocumentStorage
+	index    domain.Index
+	analyzer domain.Analyzer
+	ranker   domain.Ranker
 }
 
-func NewSearcher(storage domain.DocumentStorage, index domain.Index, tokenizer domain.Tokenizer, ranker domain.Ranker) *Searcher {
+func NewSearcher(storage domain.DocumentStorage, index domain.Index, analyzer domain.Analyzer, ranker domain.Ranker) *Searcher {
 	return &Searcher{
-		storage:   storage,
-		index:     index,
-		tokenizer: tokenizer,
-		ranker:    ranker,
+		storage:  storage,
+		index:    index,
+		analyzer: analyzer,
+		ranker:   ranker,
 	}
 }
 
@@ -31,7 +31,7 @@ func NewSearcher(storage domain.DocumentStorage, index domain.Index, tokenizer d
 // It returns a list of SearchResult sorted by relevance score in descending order,
 // limited by the specified 'limit' parameter.
 func (s *Searcher) Search(ctx context.Context, query string, limit int) ([]domain.SearchResult, error) {
-	queryTokens := s.tokenizer(query)
+	queryTokens := s.analyzer.Analyze(query)
 	if len(queryTokens) == 0 {
 		return []domain.SearchResult{}, nil
 	}
