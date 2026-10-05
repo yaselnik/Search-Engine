@@ -61,10 +61,10 @@ func (s *EngStemmer) Stem(word string) string {
 //
 // Search for the longest among the following suffixes, and perform the action indicated.
 //
-// sses:     replace by ss;
-// ied, ies: replace by i if preceded by more than one letter, otherwise by ie;
-// s:        delete if the preceding word part contains a vowel not immediately before the s;
-// us, ss:   do nothing;
+//  - sses:     replace by ss
+//  - ied, ies: replace by i if preceded by more than one letter, otherwise by ie
+//  - s:        delete if the preceding word part contains a vowel not immediately before the s
+//  - us, ss:   do nothing
 func step1a(w *StemWord) {
 
 	suffix := w.FirstSuffix("sses", "ied", "ies", "us", "ss", "s")
@@ -106,12 +106,12 @@ func step1a(w *StemWord) {
 //
 // ed edly ing ingly:
 // for ing, check if the word before the suffix is exactly one of the following exceptional cases:
-// if it's a non-vowel followed by y, replace y and ing with ie (so dying → die), then go to step 1c.
-// if it's exactly one of inn, out, cann, herr, earr or even then go to step 1c.
+//  - if it's a non-vowel followed by y, replace y and ing with ie (so dying → die), then go to step 1c.
+//  - if it's exactly one of inn, out, cann, herr, earr or even then go to step 1c.
 // delete if the preceding word part contains a vowel, and after the deletion:
-// if the word ends at, bl or iz add e (so luxuriat → luxuriate), or
-// if the word ends with a double preceded by something other than exactly a, e or o then remove the last letter (so hopp → hop but add, egg and off are not changed), or
-// if the word does not end with a double and is short, add e (so hop → hope)
+//  - if the word ends at, bl or iz add e (so luxuriat → luxuriate), or
+//  - if the word ends with a double preceded by something other than exactly a, e or o then remove the last letter (so hopp → hop but add, egg and off are not changed), or
+//  - if the word does not end with a double and is short, add e (so hop → hope)
 func step1b(w *StemWord) {
 
 	suffix := w.FirstSuffix("eedly", "ingly", "edly", "ing", "eed", "ed")
@@ -206,23 +206,23 @@ func step1c(w *StemWord) {
 //
 // Search for the longest among the following suffixes, and, if found and in R1, perform the action indicated.
 //
-// tional:               replace by tion;
-// enci:                 replace by ence;
-// anci:                 replace by ance;
-// abli:                 replace by able;
-// entli:                replace by ent;
-// izer, ization:        replace by ize;
-// ational, ation, ator: replace by ate;
-// alism, aliti, alli:   replace by al;
-// fulness:              replace by ful;
-// ousli, ousness:       replace by ous;
-// iveness, iviti:       replace by ive;
-// biliti, bli:          replace by ble;
-// ogist:                replace by og;
-// ogi:                  replace by og if preceded by l;
-// fulli:                replace by ful;
-// lessli:               replace by less;
-// li:                   delete if preceded by a valid li-ending.
+//  - tional:               replace by tion
+//  - enci:                 replace by ence
+//  - anci:                 replace by ance
+//  - abli:                 replace by able
+//  - entli:                replace by ent
+//  - izer, ization:        replace by ize
+//  - ational, ation, ator: replace by ate
+//  - alism, aliti, alli:   replace by al
+//  - fulness:              replace by ful
+//  - ousli, ousness:       replace by ous
+//  - iveness, iviti:       replace by ive
+//  - biliti, bli:          replace by ble
+//  - ogist:                replace by og
+//  - ogi:                  replace by og if preceded by l
+//  - fulli:                replace by ful
+//  - lessli:               replace by less
+//  - li:                   delete if preceded by a valid li-ending
 func step2(w *StemWord) {
 
 	suffix := w.FirstSuffix(
@@ -296,12 +296,12 @@ func step2(w *StemWord) {
 // Search for the longest among the following suffixes, and,
 // if found and in R1, perform the action indicated.
 //
-// tional:           replace by tion;
-// ational:          replace by ate;
-// alize:            replace by al;
-// icate iciti ical: replace by ic;
-// ful ness:         delete;
-// ative:            delete if in R2.
+//  - tional:           replace by tion
+//  - ational:          replace by ate
+//  - alize:            replace by al
+//  - icate iciti ical: replace by ic
+//  - ful ness:         delete
+//  - ative:            delete if in R2
 func step3(w *StemWord) {
 
 	suffix := w.FirstSuffix(
@@ -343,9 +343,9 @@ func step3(w *StemWord) {
 // Search for the longest among the following suffixes,
 // and, if found and in R2, perform the action indicated.
 //
-// al, ance, ence, er, ic, able, ible, ant, ement, ment,
-// ent, ism, ate, iti, ous, ive, ize: delete;
-// ion: delete if preceded by s or t.
+//  - al, ance, ence, er, ic, able, ible, ant, ement, ment,
+// ent, ism, ate, iti, ous, ive, ize: delete
+//  - ion: delete if preceded by s or t
 func step4(w *StemWord) {
 
 	suffix := w.FirstSuffix(
@@ -381,8 +381,8 @@ func step4(w *StemWord) {
 //
 // Search for the following suffixes, and, if found, perform the action indicated.
 //
-// e: delete if in R2, or in R1 and not preceded by a short syllable;
-// l: delete if in R2 and preceded by l.
+//  - e: delete if in R2, or in R1 and not preceded by a short syllable
+//  - l: delete if in R2 and preceded by l
 func step5(w *StemWord) {
 
 	// Last rune index = `lri`

@@ -46,7 +46,7 @@ func main() {
 	docStorage := storage.NewInMemoryStorage()
 
 	engStemmer := stemmer.NewEngStemmer()
-	stemmer := stemmer.NewMultiLanguageStemmer(engStemmer, nil)
+	stemmer := stemmer.NewMultiLanguageStemmer(engStemmer, stemmer.NoopStemmer{})
 	analyzer := analyzer.NewAnalyzer(analyzer.RegexpTokenize, analyzer.LowercaseFilter{}, stemmer)
 
 	source := loader.NewLoader(*dataPath, []string{".txt", ".md"}, docStorage, logger)
