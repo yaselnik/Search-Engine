@@ -62,6 +62,7 @@ func (r *InMemoryIndex) Add(docID domain.DocID, tokens []domain.Token) error {
 		posting := tokenStats[token.Value]
 		posting.Frequency++
 		posting.Positions = append(posting.Positions, token.Position)
+		posting.Offsets = append(posting.Offsets, token.Offset)
 
 		r.docTokens[docID][token.Value] = struct{}{}
 	}
@@ -73,8 +74,8 @@ func (r *InMemoryIndex) Add(docID domain.DocID, tokens []domain.Token) error {
 	return nil
 }
 
-// Retrieves the list of postings for a specific token.
-// Returns nil if the token is not found in the index.
+// Retrieves the list of postings for a normalized term.
+// Returns nil if the value is not found in the index.
 func (r *InMemoryIndex) GetPostings(term string) ([]domain.Posting, error) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()

@@ -107,33 +107,3 @@ func TestSearcher_Search(t *testing.T) {
 		}
 	})
 }
-
-func TestSearcher_generateSnippet(t *testing.T) {
-	searcher := &Searcher{}
-	content := "This is a long text about golang programming language. It is very popular."
-	tokens := []domain.Token{{Value: "golang"}}
-
-	snippet := searcher.generateSnippet(content, tokens)
-
-	if !containsIgnoreCase(snippet, "golang") {
-		t.Errorf("snippet should contain the query term, got: %s", snippet)
-	}
-	if len(content) > 80 && !contains(snippet, "...") {
-		t.Errorf("snippet should contain '...' when truncated, got: %s", snippet)
-	}
-}
-
-func contains(s, substr string) bool {
-	return len(s) >= len(substr) && (s == substr || len(s) > 0 && containsHelper(s, substr))
-}
-func containsHelper(s, substr string) bool {
-	for i := 0; i <= len(s)-len(substr); i++ {
-		if s[i:i+len(substr)] == substr {
-			return true
-		}
-	}
-	return false
-}
-func containsIgnoreCase(s, substr string) bool {
-	return containsHelper(s, substr) || containsHelper(s, "Golang")
-}

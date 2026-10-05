@@ -5,4 +5,5 @@ type Posting struct {
 	DocID     DocID
 	Frequency uint32
 	Positions []uint32
+	Offsets   []uint32
 }
