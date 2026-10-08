@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"sync"
 
 	"github.com/yaselnik/Search-Engine/internal/domain"
 )
@@ -16,6 +17,9 @@ type Indexer struct {
 	index    domain.Index
 	analyzer domain.Analyzer
 	logger   *slog.Logger
+
+	mu      sync.Mutex
+	indexed map[domain.DocID]struct{}
 }
 
 func NewIndexer(
@@ -33,35 +37,54 @@ func NewIndexer(
 		index:    index,
 		analyzer: analyzer,
 		logger:   logger.With("component", "indexer"),
+		indexed:  make(map[domain.DocID]struct{}),
 	}
 }
 
-// Retrieves all documents from the storage and indexes them sequentially.
-// It respects context cancellation and continues processing even if a single document
 func (i *Indexer) IndexAll(ctx context.Context) error {
-	docs, err := i.storage.GetAll(ctx)
-	if err != nil {
-		return fmt.Errorf("indexer: get all documents from storage: %w", err)
-	}
+    i.mu.Lock()
+    i.indexed = make(map[domain.DocID]struct{})
+    i.mu.Unlock()
 
-	i.logger.Info("starting indexing process", "total_documents", len(docs))
+    _, err := i.indexPending(ctx, true)
+	return err
+}
 
-	var indexed int
-	for _, doc := range docs {
-		if ctx.Err() != nil {
-			i.logger.Warn("indexing cancelled via context", "indexed_so_far", indexed)
-			return fmt.Errorf("indexer: context cancelled: %w", ctx.Err())
-		}
+func (i *Indexer) IndexNew(ctx context.Context) (int, error) {
+    return i.indexPending(ctx, false)
+}
 
-		if err := i.IndexDocument(ctx, doc); err != nil {
-			i.logger.Error("failed to index document", "doc_id", doc.ID, "title", doc.Title, "error", err)
-			continue
-		}
-		indexed++
-	}
+func (i *Indexer) indexPending(ctx context.Context, full bool) (int, error) {
+    docs, err := i.storage.GetAll(ctx)
+    if err != nil {
+        return 0, fmt.Errorf("indexer: get all documents: %w", err)
+    }
 
-	i.logger.Info("indexing process completed", "indexed", indexed, "total", len(docs))
-	return nil
+    i.mu.Lock()
+    defer i.mu.Unlock()
+
+    var indexed int
+    for _, doc := range docs {
+        if ctx.Err() != nil {
+            return indexed, ctx.Err()
+        }
+
+        if !full {
+            if _, ok := i.indexed[doc.ID]; ok {
+                continue
+            }
+        }
+
+        if err := i.IndexDocument(ctx, doc); err != nil {
+            i.logger.Error("index doc failed", "doc_id", doc.ID, "error", err)
+            continue
+        }
+
+        i.indexed[doc.ID] = struct{}{}
+        indexed++
+    }
+
+    return indexed, nil
 }
 
 // IndexDocument tokenizes a single document's content and adds it to the index.

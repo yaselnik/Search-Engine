@@ -9,3 +9,7 @@ var (
 	ErrDocumentNotFound = errors.New("document not found")
 	ErrInvalidDocument  = errors.New("invalid document")
 )
+
+var (
+	ErrRobotstxtProhibition = errors.New("blocked by robots.txt")
+)

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"log/slog"
 	"net/http"
@@ -11,20 +12,24 @@ import (
 	"time"
 
 	httpDelivery "github.com/yaselnik/Search-Engine/internal/delivery/http"
+	"github.com/yaselnik/Search-Engine/internal/domain"
 	"github.com/yaselnik/Search-Engine/internal/infrastructure/analyzer"
 	"github.com/yaselnik/Search-Engine/internal/infrastructure/analyzer/stemmer"
+	"github.com/yaselnik/Search-Engine/internal/infrastructure/crawler/fetcher"
+	"github.com/yaselnik/Search-Engine/internal/infrastructure/crawler/frontier"
+	parserHTML "github.com/yaselnik/Search-Engine/internal/infrastructure/crawler/parser"
 	"github.com/yaselnik/Search-Engine/internal/infrastructure/index"
-	"github.com/yaselnik/Search-Engine/internal/infrastructure/loader"
 	"github.com/yaselnik/Search-Engine/internal/infrastructure/ranker"
 	"github.com/yaselnik/Search-Engine/internal/infrastructure/storage"
+	"github.com/yaselnik/Search-Engine/internal/usecase/crawler"
 	"github.com/yaselnik/Search-Engine/internal/usecase/indexer"
 	"github.com/yaselnik/Search-Engine/internal/usecase/searcher"
 )
 
 func main() {
-	dataPath := flag.String("data", "./data", "path to directory with documents")
 	logLevel := flag.String("log-level", "info", "log level (debug, info, warn, error)")
 	httpAddr := flag.String("addr", ":8080", "http server address")
+	indexInterval := flag.Duration("index-interval", 2*time.Second, "how often to index new documents")
 	flag.Parse()
 
 	var level slog.Level
@@ -37,7 +42,7 @@ func main() {
 	}))
 	slog.SetDefault(logger)
 
-	logger.Info("starting search engine", "data_path", *dataPath, "log_level", level.String())
+	logger.Info("starting search engine", "log_level", level.String())
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
@@ -49,19 +54,27 @@ func main() {
 	stemmer := stemmer.NewMultiLanguageStemmer(engStemmer, stemmer.NoopStemmer{})
 	analyzer := analyzer.NewAnalyzer(analyzer.RegexpTokenize, analyzer.LowercaseFilter{}, stemmer)
 
-	source := loader.NewLoader(*dataPath, []string{".txt", ".md"}, docStorage, logger)
-	loaded, err := source.Load(ctx)
-	if err != nil {
-		logger.Error("load failed, exiting", "error", err)
-		os.Exit(1)
-	}
-	logger.Info("documents loaded successfully", "count", loaded)
+	crFetcher := fetcher.NewFetcher(nil, "SearchEngineBot/0.1")
+	crParser := parserHTML.NewParser()
+	crFrontier := frontier.NewMemFrontier(nil, logger)
+
+	_ = crFrontier.Push(ctx, []domain.FrontierItem{
+		{URL: "https://go.dev", Host: "go.dev"},
+		{URL: "https://en.wikipedia.org/wiki/Main_Page", Host: "en.wikipedia.org"},
+	})
+
+	cr := crawler.NewCrawler(
+		crFrontier, crFetcher, crParser, docStorage,
+		crawler.Options{
+			FetcherWorkers: 20,
+			ParserWorkers:  5,
+			MaxPages:       1000,
+			SameHost:       false,
+			RawBufferSize:  500,
+		},
+		logger)
 
 	indexerUC := indexer.NewIndexer(docStorage, idx, analyzer, logger)
-	if err := indexerUC.IndexAll(ctx); err != nil {
-		logger.Error("indexing failed, exiting", "error", err)
-		os.Exit(1)
-	}
 
 	bm25 := ranker.NewBM25()
 	searcher := searcher.NewSearcher(docStorage, idx, analyzer, bm25)
@@ -85,6 +98,33 @@ func main() {
 	}
 
 	go func() {
+		logger.Info("background indexer started", "interval", indexInterval.String())
+
+		ticker := time.NewTicker(*indexInterval)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				logger.Info("background indexer stopped")
+				return
+			case <-ticker.C:
+				n, err := indexerUC.IndexNew(ctx)
+				if err != nil {
+					if errors.Is(err, context.Canceled) {
+						return
+					}
+					logger.Warn("indexer tick failed", "error", err)
+					continue
+				}
+				if n > 0 {
+					logger.Info("indexed new documents", "count", n)
+				}
+			}
+		}
+	}()
+
+	go func() {
 		logger.Info("http server started", "addr", *httpAddr)
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			logger.Error("http server failed", "error", err)
@@ -92,6 +132,23 @@ func main() {
 		}
 	}()
 
+	logger.Info("starting crawler")
+	loaded, err := cr.Start(ctx)
+	if err != nil && !errors.Is(err, context.Canceled) {
+		logger.Error("crawler failed", "error", err)
+	}
+
+	logger.Info("crawler finished", "loaded", loaded)
+
+	if n, err := indexerUC.IndexNew(ctx); err != nil {
+		if !errors.Is(err, context.Canceled) {
+			logger.Warn("final index pass failed", "error", err)
+		}
+	} else if n > 0 {
+		logger.Info("final index pass", "count", n)
+	}
+
+	logger.Info("crawling complete, serving search results")
 	<-ctx.Done()
 	logger.Info("shutting down gracefully...")
 
