@@ -2,149 +2,81 @@ package frontier
 
 import (
 	"context"
+	"hash/fnv"
 	"log/slog"
-	"net/http"
 	"net/url"
-	"sync"
-	"time"
+	"runtime"
+	"sync/atomic"
 
 	"github.com/yaselnik/Search-Engine/internal/domain"
 )
 
-var _ domain.Frontier = (*MemFrontier)(nil)
+var _ domain.IFrontier = (*Frontier)(nil)
 
-const (
-	defaultCrawlDelay = time.Second
-)
-
-type hostState struct {
-	queue      []domain.FrontierItem
-	lastReq    time.Time
-	crawlDelay time.Duration
-}
-
-type MemFrontier struct {
-	mu sync.RWMutex
-
-	hosts map[string]*hostState
-
-	seen map[string]struct{}
-
-	robots *RobotsCache
-
+type Frontier struct {
+	shards []*Shard
+	rr     atomic.Uint64 // for round-robin shard lease
 	logger *slog.Logger
-
-	client *http.Client
-
-	maxSize int
 }
 
-func NewMemFrontier(client *http.Client, logger *slog.Logger) *MemFrontier {
-	if client == nil {
-		client = &http.Client{Timeout: robotsTimeout}
+func NewFrontier(ctx context.Context, shardsCount int, logger *slog.Logger) *Frontier {
+	if shardsCount <= 0 {
+		shardsCount = 2 * runtime.NumCPU()
 	}
-	return &MemFrontier{
-		hosts:   make(map[string]*hostState),
-		seen:    make(map[string]struct{}),
-		robots:  NewRobotsCache(client, logger),
-		client:  client,
-		logger:  logger.With("component", "frontier"),
-		maxSize: 1_000_000,
+	f := &Frontier{
+		shards: make([]*Shard, shardsCount),
+		logger: logger.With("component", "frontier"),
+	}
+	for i := range f.shards {
+		f.shards[i] = NewShard(ctx, logger)
+	}
+	f.logger.Info("frontier started", "shards", shardsCount)
+	return f
+}
+
+func (f *Frontier) Close() {
+	for _, s := range f.shards {
+		s.Close()
 	}
 }
 
-func (f *MemFrontier) Push(ctx context.Context, items []domain.FrontierItem) bool {
-	for _, it := range items {
-		host := it.Host
-		if host == "" {
-			host = hostOf(it.URL)
-		}
-		allowed, crawlDelay := f.checkRobots(ctx, host, it.URL)
-
-		f.mu.Lock()
-
-		if len(f.seen) >= f.maxSize {
-			f.mu.Unlock()
-			return false
-		}
-
-		if _, ok := f.seen[it.URL]; ok {
-			f.mu.Unlock()
-			continue
-		}
-
-		if !allowed {
-			f.seen[it.URL] = struct{}{}
-			f.mu.Unlock()
-			continue
-		}
-
-		st, ok := f.hosts[host]
-		if !ok {
-			st = &hostState{crawlDelay: defaultCrawlDelay}
-			f.hosts[host] = st
-		}
-		if crawlDelay > 0 {
-			st.crawlDelay = crawlDelay
-		}
-		st.queue = append(st.queue, it)
-		f.seen[it.URL] = struct{}{}
-
-		f.mu.Unlock()
-	}
-
-	return true
+func (f *Frontier) hostToShard(host string) int {
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(host))
+	return int(h.Sum32()%uint32(len(f.shards)))
 }
 
-func (f *MemFrontier) Pop(ctx context.Context, workerID string, n int) ([]domain.FrontierItem, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-
-	now := time.Now()
-	out := make([]domain.FrontierItem, 0, n)
-
-	for _, st := range f.hosts {
-		if len(out) >= n {
-			break
+func (f *Frontier) Push(ctx context.Context, items []domain.NormalizedURL) error {
+	for _, item := range items {
+		shardIndex := f.hostToShard(item.Host)
+		if err := f.shards[shardIndex].Push(ctx, item); err != nil {
+			return err
 		}
-		if len(st.queue) == 0 {
-			continue
-		}
-		if now.Sub(st.lastReq) < st.crawlDelay {
-			continue
-		}
-
-		item := st.queue[0]
-		st.queue = st.queue[1:]
-		st.lastReq = now
-		out = append(out, item)
 	}
+	return nil
+}
 
+func (f *Frontier) Lease(ctx context.Context, n int) ([]string, error) {
+	out := make([]string, 0, n)
+
+	start := int(f.rr.Add(1)) % len(f.shards)
+	for i := 0; i < len(f.shards) && len(out) < n; i++ {
+		idx := (start + i) % len(f.shards)
+		batch, err := f.shards[idx].Lease(ctx, n-len(out))
+		if err != nil {
+			return out, err
+		}
+		out = append(out, batch...)
+	}
 	return out, nil
 }
 
-func (f *MemFrontier) Ack(ctx context.Context, url string) error {
-	return nil
+func (f *Frontier) Ack(ctx context.Context, url string) error {
+	return f.shards[f.hostToShard(hostOf(url))].Ack(ctx, url)
 }
 
-func (f *MemFrontier) Nack(ctx context.Context, url string, retryAfter time.Duration, permanent bool) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-
-	if permanent {
-		f.seen[url] = struct{}{}
-		return nil
-	}
-
-	host := hostOf(url)
-	st := f.hosts[host]
-
-	st.lastReq = time.Now().Add(retryAfter - st.crawlDelay)
-	st.queue = append(st.queue, domain.FrontierItem{
-		URL:  url,
-		Host: host,
-	})
-	return nil
+func (f *Frontier) Nack(ctx context.Context, url string) error {
+	return f.shards[f.hostToShard(hostOf(url))].Nack(ctx, url)
 }
 
 func hostOf(rawURL string) string {
@@ -153,23 +85,4 @@ func hostOf(rawURL string) string {
 		return ""
 	}
 	return u.Host
-}
-
-func (f *MemFrontier) checkRobots(ctx context.Context, host, rawURL string) (allowed bool, crawlDelay time.Duration) {
-	robots, err := f.robots.Get(ctx, host)
-	if err != nil || robots == nil {
-		return true, 0
-	}
-
-	group := robots.FindGroup(robotsUserAgent)
-	if group == nil {
-		return true, 0
-	}
-
-	u, err := url.Parse(rawURL)
-	if err != nil {
-		return false, 0
-	}
-
-	return group.Test(u.Path), group.CrawlDelay
 }

@@ -2,7 +2,6 @@ package crawler
 
 import (
 	"context"
-	"fmt"
 	"hash/fnv"
 	"log/slog"
 	"net/url"
@@ -22,7 +21,7 @@ type Options struct {
 }
 
 type Crawler struct {
-	frontier domain.Frontier
+	frontier domain.IFrontier
 	fetcher  domain.Fetcher
 	parser   domain.Parser
 	storage  domain.DocumentStorage
@@ -39,7 +38,7 @@ type Crawler struct {
 }
 
 func NewCrawler(
-	frontier domain.Frontier,
+	frontier domain.IFrontier,
 	fetcher domain.Fetcher,
 	parser domain.Parser,
 	storage domain.DocumentStorage,
@@ -80,7 +79,7 @@ func (c *Crawler) Start(ctx context.Context) (int, error) {
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
-			c.runFetcher(ctx, fmt.Sprintf("fetcher-%d", id))
+			c.runFetcher(ctx, id)
 		}(i)
 	}
 
@@ -135,7 +134,7 @@ func (c *Crawler) shouldStop() bool {
 	return c.loaded.Load() >= int64(c.opts.MaxPages)
 }
 
-func (c *Crawler) runFetcher(ctx context.Context, workerID string) {
+func (c *Crawler) runFetcher(ctx context.Context, _ int) {
 	for {
 		if c.shouldStop() {
 			return
@@ -146,34 +145,39 @@ func (c *Crawler) runFetcher(ctx context.Context, workerID string) {
 		default:
 		}
 
-		items, err := c.frontier.Pop(ctx, workerID, 10)
+		URLs, err := c.frontier.Lease(ctx, 10)
 		if err != nil {
-			c.logger.Error("frontier pop failed", "error", err)
+			c.logger.Error("frontier lease failed", "error", err)
 			time.Sleep(time.Second)
 			continue
 		}
-		if len(items) == 0 {
-			time.Sleep(200 * time.Millisecond)
+		if len(URLs) == 0 {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(200 * time.Millisecond):
+			}
 			continue
 		}
 
-		for _, item := range items {
+		for _, URL := range URLs {
 			if c.shouldStop() {
-				_ = c.frontier.Nack(ctx, item.URL, 0, false)
+				c.inflight.Add(-1)
+				_ = c.frontier.Nack(ctx, URL)
 				return
 			}
 			c.inflight.Add(1)
-			page, err := c.fetcher.Fetch(ctx, item.URL)
+			page, err := c.fetcher.Fetch(ctx, URL)
 			if err != nil {
 				c.inflight.Add(-1)
-				c.logger.Warn("fetch failed", "url", item.URL, "error", err)
-				_ = c.frontier.Nack(ctx, item.URL, time.Minute, false)
+				c.logger.Warn("fetch failed", "url", URL, "error", err)
+				_ = c.frontier.Nack(ctx, URL)
 				continue
 			}
 
 			select {
 			case c.rawPages <- page:
-				_ = c.frontier.Ack(ctx, item.URL)
+				_ = c.frontier.Ack(ctx, URL)
 			case <-ctx.Done():
 				c.inflight.Add(-1)
 				return
@@ -182,6 +186,7 @@ func (c *Crawler) runFetcher(ctx context.Context, workerID string) {
 		}
 	}
 }
+
 
 func (c *Crawler) runParser(ctx context.Context) {
 	for {
@@ -218,12 +223,12 @@ func (c *Crawler) parseOne(ctx context.Context, page *domain.FetchedPage) {
 	}
 
 	baseHost := hostOf(page.URL)
-	var newItems []domain.FrontierItem
+	var newItems []domain.NormalizedURL
 	for _, link := range parsed.Links {
 		if c.opts.SameHost && hostOf(link) != baseHost {
 			continue
 		}
-		newItems = append(newItems, domain.FrontierItem{
+		newItems = append(newItems, domain.NormalizedURL{
 			URL:  link,
 			Host: hostOf(link),
 		})

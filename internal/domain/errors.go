@@ -10,6 +10,7 @@ var (
 	ErrInvalidDocument  = errors.New("invalid document")
 )
 
+// Crawler Frontier errors
 var (
-	ErrRobotstxtProhibition = errors.New("blocked by robots.txt")
+	ErrPageProcessingTimeoutExceeded = errors.New("Page processing timeout exceeded")
 )

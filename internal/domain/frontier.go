@@ -1,18 +1,44 @@
 package domain
 
 import (
-    "context"
-    "time"
+	"context"
+	"time"
 )
 
-type Frontier interface {
-    Push(ctx context.Context, items []FrontierItem) bool
-    Pop(ctx context.Context, workerID string, n int) ([]FrontierItem, error)
-    Ack(ctx context.Context, url string) error
-    Nack(ctx context.Context, url string, retryAfter time.Duration, permanent bool) error
+type IFrontier interface {
+	Push(ctx context.Context, items []NormalizedURL) error
+	Lease(ctx context.Context, n int) ([]string, error)
+	Ack(ctx context.Context, url string) error
+	Nack(ctx context.Context, url string) error
 }
 
+type FrontierItemState int8
+
+const (
+	StateNew FrontierItemState = iota
+	StateQueued
+	StateInFlight
+	StateDone
+	StateFailed
+	StateNotAllowed
+)
+
 type FrontierItem struct {
-    URL           string
-    Host          string
+	URL          string
+	Host         string
+	State        FrontierItemState
+	Priority     float64
+	LastFetchAt  time.Time
+	NextFetchAt  time.Time
+	FetchCount   int
+	FailCount    int
+	LastResp     int
+	ChangeFreq   time.Duration
+	DiscoveredAt time.Time
+	PageRank     int
+}
+
+type NormalizedURL struct {
+	URL  string
+	Host string
 }

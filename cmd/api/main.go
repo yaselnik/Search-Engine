@@ -26,6 +26,59 @@ import (
 	"github.com/yaselnik/Search-Engine/internal/usecase/searcher"
 )
 
+var SeedURLs = []domain.NormalizedURL{
+	{URL: "https://go.dev/", Host: "go.dev"},
+	{URL: "https://go.dev/doc/", Host: "go.dev"},
+	{URL: "https://go.dev/blog/", Host: "go.dev"},
+	{URL: "https://pkg.go.dev/", Host: "pkg.go.dev"},
+	{URL: "https://github.com/explore", Host: "github.com"},
+	{URL: "https://github.com/topics", Host: "github.com"},
+	{URL: "https://stackoverflow.com/questions", Host: "stackoverflow.com"},
+	{URL: "https://news.ycombinator.com/", Host: "news.ycombinator.com"},
+	{URL: "https://lobste.rs/", Host: "lobste.rs"},
+	{URL: "https://dev.to/", Host: "dev.to"},
+	{URL: "https://en.wikipedia.org/wiki/Main_Page", Host: "en.wikipedia.org"},
+	{URL: "https://en.wikipedia.org/wiki/Go_(programming_language)", Host: "en.wikipedia.org"},
+	{URL: "https://en.wikipedia.org/wiki/Search_engine", Host: "en.wikipedia.org"},
+	{URL: "https://en.wiktionary.org/wiki/Wiktionary:Main_Page", Host: "en.wiktionary.org"},
+	{URL: "https://www.britannica.com/", Host: "www.britannica.com"},
+	{URL: "https://www.wikidata.org/wiki/Wikidata:Main_Page", Host: "www.wikidata.org"},
+	{URL: "https://commons.wikimedia.org/wiki/Main_Page", Host: "commons.wikimedia.org"},
+	{URL: "https://en.wikisource.org/wiki/Main_Page", Host: "en.wikisource.org"},
+	{URL: "https://www.bbc.com/news", Host: "www.bbc.com"},
+	{URL: "https://edition.cnn.com/", Host: "edition.cnn.com"},
+	{URL: "https://www.reuters.com/", Host: "www.reuters.com"},
+	{URL: "https://apnews.com/", Host: "apnews.com"},
+	{URL: "https://www.theguardian.com/international", Host: "www.theguardian.com"},
+	{URL: "https://www.nytimes.com/", Host: "www.nytimes.com"},
+	{URL: "https://www.aljazeera.com/", Host: "www.aljazeera.com"},
+	{URL: "https://www.npr.org/", Host: "www.npr.org"},
+	{URL: "https://medium.com/", Host: "medium.com"},
+	{URL: "https://www.reddit.com/r/programming/", Host: "www.reddit.com"},
+	{URL: "https://www.reddit.com/r/golang/", Host: "www.reddit.com"},
+	{URL: "https://arstechnica.com/", Host: "arstechnica.com"},
+	{URL: "https://www.theverge.com/", Host: "www.theverge.com"},
+	{URL: "https://www.wired.com/", Host: "www.wired.com"},
+	{URL: "https://techcrunch.com/", Host: "techcrunch.com"},
+	{URL: "https://www.infoq.com/", Host: "www.infoq.com"},
+	{URL: "https://martinfowler.com/", Host: "martinfowler.com"},
+	{URL: "https://blog.cloudflare.com/", Host: "blog.cloudflare.com"},
+	{URL: "https://ru.wikipedia.org/wiki/Заглавная_страница", Host: "ru.wikipedia.org"},
+	{URL: "https://ru.wikipedia.org/wiki/Поисковая_система", Host: "ru.wikipedia.org"},
+	{URL: "https://habr.com/ru/", Host: "habr.com"},
+	{URL: "https://habr.com/ru/all/", Host: "habr.com"},
+	{URL: "https://habr.com/ru/hubs/go/", Host: "habr.com"},
+	{URL: "https://lenta.ru/", Host: "lenta.ru"},
+	{URL: "https://www.rbc.ru/", Host: "www.rbc.ru"},
+	{URL: "https://tass.ru/", Host: "tass.ru"},
+	{URL: "https://arxiv.org/", Host: "arxiv.org"},
+	{URL: "https://www.nature.com/", Host: "www.nature.com"},
+	{URL: "https://www.science.org/", Host: "www.science.org"},
+	{URL: "https://developer.mozilla.org/en-US/", Host: "developer.mozilla.org"},
+	{URL: "https://docs.python.org/3/", Host: "docs.python.org"},
+	{URL: "https://doc.rust-lang.org/book/", Host: "doc.rust-lang.org"},
+}
+
 func main() {
 	logLevel := flag.String("log-level", "info", "log level (debug, info, warn, error)")
 	httpAddr := flag.String("addr", ":8080", "http server address")
@@ -56,19 +109,21 @@ func main() {
 
 	crFetcher := fetcher.NewFetcher(nil, "SearchEngineBot/0.1")
 	crParser := parserHTML.NewParser()
-	crFrontier := frontier.NewMemFrontier(nil, logger)
+	crFrontier := frontier.NewFrontier(ctx, 0, logger)
+	defer crFrontier.Close()
 
-	_ = crFrontier.Push(ctx, []domain.FrontierItem{
-		{URL: "https://go.dev", Host: "go.dev"},
-		{URL: "https://en.wikipedia.org/wiki/Main_Page", Host: "en.wikipedia.org"},
-	})
+	if err := crFrontier.Push(ctx, SeedURLs); err != nil {
+		logger.Error("seed push failed", "error", err)
+		return
+	}
+	logger.Info("seeds pushed", "count", len(SeedURLs))
 
 	cr := crawler.NewCrawler(
 		crFrontier, crFetcher, crParser, docStorage,
 		crawler.Options{
 			FetcherWorkers: 20,
-			ParserWorkers:  5,
-			MaxPages:       1000,
+			ParserWorkers:  12,
+			MaxPages:       10000,
 			SameHost:       false,
 			RawBufferSize:  500,
 		},
