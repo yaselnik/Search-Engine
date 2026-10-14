@@ -2,6 +2,7 @@ package frontier
 
 import "time"
 
+// HostState tracks the crawling state and rate-limiting metrics for a specific host.
 type HostState struct {
 	name       string
 	lastReq    time.Time
@@ -10,6 +11,10 @@ type HostState struct {
 	inQueue    bool
 }
 
+// HostsQueue implements heap.Interface for *HostState.
+// It acts as a Min-Heap sorted by HostState.readyAt.
+// This ensures that the crawler always attempts to fetch from the host
+// that has been waiting the longest past its crawl-delay.
 type HostsQueue []*HostState
 
 func (pq HostsQueue) Len() int { return len(pq) }

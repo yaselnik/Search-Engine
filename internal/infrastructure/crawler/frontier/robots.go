@@ -23,6 +23,9 @@ type robotsEntry struct {
 	loading chan struct{}
 }
 
+// RobotsCache provides a thread-safe, singleflight-like cache for robots.txt data.
+// It prevents the "thundering herd" problem where multiple concurrent workers
+// might simultaneously attempt to download the same host's robots.txt file.
 type RobotsCache struct {
 	mu      sync.Mutex
 	entries map[string]*robotsEntry
@@ -101,7 +104,9 @@ func (c *RobotsCache) load(ctx context.Context, host string, e *robotsEntry) {
 	c.logger.Debug("robots loaded", "host", host)
 }
 
-
+// GetRobots checks if a URL is allowed to be crawled and returns the required crawl delay.
+// If the robots.txt is not yet cached, it blocks other concurrent requests for the same
+// host until the fetch is complete, returning the cached result to all waiters.
 func (r *RobotsCache) GetRobots(ctx context.Context, host, url string) (bool, time.Duration) {
 	robots, err := r.get(ctx, host)
 	if err != nil || robots == nil {

@@ -15,6 +15,13 @@ const (
 	leaseTimeout   = 2 * time.Minute
 )
 
+// Shard represents an independent partition of the frontier state.
+// It manages its own mutex, host queues, and page queues, allowing
+// concurrent operations across different shards without blocking.
+//
+// Each shard runs a background [Shard.reaper] goroutine that monitors
+// in-flight pages and requeues them if they exceed the lease timeout,
+// ensuring fault tolerance against crashed crawler workers.
 type Shard struct {
 	mu sync.Mutex
 
@@ -35,6 +42,8 @@ type Shard struct {
 	wg     sync.WaitGroup
 }
 
+// NewShard creates and starts a new Shard.
+// It automatically launches the background reaper goroutine.
 func NewShard(parentCtx context.Context, logger *slog.Logger) *Shard {
 	ctx, cancel := context.WithCancel(parentCtx)
 	s := &Shard{
@@ -59,6 +68,9 @@ func (s *Shard) Close() {
 	s.wg.Wait()
 }
 
+// reaper is a background loop that periodically checks for stalled in-flight pages.
+// If a page has been in-flight longer than leaseTimeout, it is considered failed
+// and is requeued with an incremented fail count.
 func (s *Shard) reaper() {
 	defer s.wg.Done()
 	t := time.NewTicker(reaperInterval)
@@ -94,6 +106,8 @@ func (s *Shard) requeue() {
 	}
 }
 
+// Push adds a single URL to the shard's queue. It checks robots.txt rules,
+// initializes host state if necessary, and updates the page's priority.
 func (s *Shard) Push(ctx context.Context, item domain.NormalizedURL) error {
 	allowed, delay := s.robots.GetRobots(ctx, item.Host, item.URL)
 
@@ -167,6 +181,10 @@ func countPagePriority(page *domain.FrontierItem) float64 {
 	return p
 }
 
+
+// Lease extracts up to 'n' pages from the shard that are ready to be fetched.
+// A page is considered ready if its host's crawl-delay timer has expired.
+// Leased pages are marked as in-flight.
 func (s *Shard) Lease(ctx context.Context, n int) ([]string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -202,6 +220,7 @@ func (s *Shard) Lease(ctx context.Context, n int) ([]string, error) {
 	return out, nil
 }
 
+// Ack marks a leased page as done and resets the host's rate-limit timer.
 func (s *Shard) Ack(ctx context.Context, url string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -222,6 +241,7 @@ func (s *Shard) Ack(ctx context.Context, url string) error {
 	return nil
 }
 
+// Nack marks a leased page as failed and schedules it for retry.
 func (s *Shard) Nack(ctx context.Context, url string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()

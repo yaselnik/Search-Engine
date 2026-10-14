@@ -5,6 +5,10 @@ type QueuedPage struct {
 	priority float64
 }
 
+// PageQueue implements heap.Interface for *QueuedPage.
+// It acts as a Max-Heap sorted by QueuedPage.priority.
+// This ensures that higher-value pages (e.g., higher PageRank)
+// are fetched first within a specific host.
 type PageQueue []*QueuedPage
 
 func (pq PageQueue) Len() int { return len(pq) }
