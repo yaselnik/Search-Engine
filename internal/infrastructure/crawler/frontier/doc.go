@@ -1,31 +1,44 @@
-// Package frontier provides a high-performance, sharded URL queue for web crawling.
+// Package frontier provides a high-performance, sharded URL queue for polite web crawling.
 //
 // # Architecture
 //
-// The frontier is designed to support "polite crawling" by enforcing per-host
-// rate limits (Crawl-Delay) while maximizing throughput via concurrency.
-// To avoid global lock contention under high load, the state is partitioned
-// into multiple independent shards.
-//
-// The architecture consists of three main layers:
-//   - [Frontier]: The main entry point that routes URLs to specific [Shard] instances
-//     based on the host hash (FNV-1a).
-//   - [Shard]: An independent worker managing its own state, host queues, and a
-//     background reaper goroutine for fault tolerance.
-//   - Priority Queues: Each shard uses a min-heap for hosts ([HostsQueue]) sorted
-//     by readiness time, and a max-heap for pages ([PageQueue]) sorted by priority.
+// The frontier enforces per-host politeness constraints (at most one active in-flight
+// request per host and Crawl-Delay compliance) while maximizing throughput across
+// multiple hosts via sharding:
+//   - [Frontier]: The main orchestrator and router that partitions incoming URLs across
+//     [Shard] instances based on an FNV-1a hash of the hostname.
+//   - [Shard]: An isolated state partition managing host readiness queues ([HostsQueue]),
+//     per-host priority queues ([PageQueue]), scheduled retry/refresh sets, compact
+//     tombstones for dead URLs, and a background reaper goroutine.
+//   - [RobotsCache]: A bounded, thread-safe LRU cache with singleflight request coalescing,
+//     TTL/HTTP Expires support, and negative caching for robots.txt rules.
+//   - [Config]: A serializable configuration struct (YAML/ENV compatible) paired with
+//     functional [Option] helpers for injecting runtime dependencies such as custom HTTP clients.
 //
 // # State Machine
 //
-// URLs processed by the crawler follow a Lease/Ack/Nack semantic to ensure
-// no data is lost even if a worker crashes:
+// URLs managed by the frontier follow a strict Lease/Ack/Nack/MarkDead lifecycle to
+// guarantee fault tolerance, politeness, and bounded memory usage:
 //
-//  1. Push: A new URL is discovered and added to the queue (StateQueued).
-//  2. Lease: A worker requests a batch of URLs. They transition to StateInFlight.
-//  3. Ack: The worker successfully processed the URL. It transitions to StateDone.
-//  4. Nack: The worker failed to process the URL. It is requeued with an exponential
-//     backoff based on its failure count.
+//  1. Push: A discovered URL is checked against the shard's dead-page tombstones and
+//     the host's robots.txt rules (via URL path matching). Allowed URLs are scored by a
+//     multi-factor priority formula (in-degree importance, Poisson staleness/novelty urgency,
+//     failure penalty, and URL path depth) and placed into the host's [PageQueue] (StateQueued).
+//  2. Lease: A worker leases a batch of ready URLs from hosts whose Crawl-Delay has expired
+//     and which have no active in-flight requests. Both the page and the host transition to
+//     an in-flight state (StateInFlight).
+//  3. Ack / AckWithHash: The worker confirms a successful download. The page transitions to
+//     StateDone, content change metrics are updated from the 64-bit content hash, the host lock
+//     is released, and the page is placed into the scheduled set until its adaptive NextFetchAt.
+//  4. Nack: The worker reports a transient failure. The page transitions to StateFailed,
+//     the host lock is released, and the page is scheduled for retry using exponential backoff
+//     with random jitter. Once FailCount exceeds MaxFailCount, the page is permanently retired.
+//  5. MarkDead: The worker reports a permanent failure (e.g., HTTP 404/410/403 or unsupported
+//     MIME type). The full FrontierItem is immediately evicted from memory and replaced with
+//     an 8-byte FNV-64a tombstone in deadPages so the URL is never crawled again.
 //
-// If a worker crashes and never calls Ack or Nack, the shard's internal [Shard.reaper]
-// will eventually detect the timeout and requeue the URL automatically.
+// If a worker crashes and never calls Ack, Nack, or MarkDead, the shard's background
+// [Shard.reaper] detects the expired lease timeout, increments FailCount, releases the host,
+// and either reschedules or retires the URL. The reaper also promotes due pages from
+// StateDone and StateFailed back into [PageQueue] once their NextFetchAt timestamp arrives.
 package frontier

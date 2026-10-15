@@ -2,10 +2,11 @@ package frontier
 
 import (
 	"context"
+	"errors"
 	"hash/fnv"
 	"log/slog"
 	"net/url"
-	"runtime"
+	"sync"
 	"sync/atomic"
 
 	"github.com/yaselnik/Search-Engine/internal/domain"
@@ -13,63 +14,123 @@ import (
 
 var _ domain.IFrontier = (*Frontier)(nil)
 
-// Frontier is the main orchestrator for the URL queue.
-// It acts as a router, distributing incoming URLs across multiple [Shard] instances
-// based on the hostname hash. This design ensures that operations on different hosts
-// do not block each other.
+// Frontier is the main orchestrator for the sharded URL queue.
+// It routes URLs to their owning shard by hostname hash so that politeness state
+// and robots.txt caches for any given host are completely localized to a single shard.
 type Frontier struct {
 	shards []*Shard
 	rr     atomic.Uint64 // round-robin counter for fair shard leasing
 	logger *slog.Logger
 }
 
-// NewFrontier creates a new sharded Frontier.
-// If shardsCount is <= 0, it defaults to 2 * runtime.NumCPU() to maximize
-// parallel processing capabilities of the host machine.
-func NewFrontier(ctx context.Context, shardsCount int, logger *slog.Logger) *Frontier {
-	if shardsCount <= 0 {
-		shardsCount = 2 * runtime.NumCPU()
+// NewFrontier creates a new Frontier with the specified number of shards and default settings.
+func NewFrontier(ctx context.Context, shardsCount int, logger *slog.Logger, opts ...Option) *Frontier {
+	cfg := DefaultConfig()
+	if shardsCount > 0 {
+		cfg.ShardsCount = shardsCount
 	}
+	return NewFrontierWithConfig(ctx, cfg, logger, opts...)
+}
+
+// NewFrontierWithConfig creates a new Frontier using the provided Config and runtime Options.
+func NewFrontierWithConfig(ctx context.Context, cfg Config, logger *slog.Logger, opts ...Option) *Frontier {
+	cfg = cfg.withDefaults()
+	if logger == nil {
+		logger = slog.Default()
+	}
+
+	var o options
+	for _, opt := range opts {
+		opt(&o)
+	}
+
 	f := &Frontier{
-		shards: make([]*Shard, shardsCount),
+		shards: make([]*Shard, cfg.ShardsCount),
 		logger: logger.With("component", "frontier"),
 	}
 	for i := range f.shards {
-		f.shards[i] = NewShard(ctx, logger)
+		f.shards[i] = NewShardWithConfig(ctx, i, cfg, o.httpClient, logger)
 	}
-	f.logger.Info("frontier started", "shards", shardsCount)
+	f.logger.Info("frontier started", "shards", cfg.ShardsCount)
 	return f
 }
 
+// Close gracefully shuts down all underlying shards and logs aggregated statistics.
 func (f *Frontier) Close() {
+	var totalHosts, activePages, deadPages int
 	for _, s := range f.shards {
+		h, a, d := s.stats()
+		totalHosts += h
+		activePages += a
+		deadPages += d
 		s.Close()
 	}
+	f.logger.Info("frontier closed",
+		"shards", len(f.shards),
+		"total_hosts", totalHosts,
+		"active_pages", activePages,
+		"dead_pages", deadPages,
+	)
 }
 
-// Close gracefully shuts down all shards
 func (f *Frontier) hostToShard(host string) int {
 	h := fnv.New32a()
 	_, _ = h.Write([]byte(host))
-	return int(h.Sum32()%uint32(len(f.shards)))
+	return int(h.Sum32() % uint32(len(f.shards)))
 }
 
 // Push adds a batch of normalized URLs to the frontier.
-// Each URL is routed to the appropriate shard based on its host.
-// Returns an error if any underlying shard fails to enqueue the item.
+// If the batch spans multiple shards, items are grouped by shard and pushed concurrently
+// so a slow robots.txt fetch in one shard never blocks unrelated shards.
 func (f *Frontier) Push(ctx context.Context, items []domain.NormalizedURL) error {
+	if len(items) == 0 {
+		return nil
+	}
+
+	buckets := make(map[int][]domain.NormalizedURL)
 	for _, item := range items {
-		shardIndex := f.hostToShard(item.Host)
-		if err := f.shards[shardIndex].Push(ctx, item); err != nil {
-			return err
+		idx := f.hostToShard(item.Host)
+		buckets[idx] = append(buckets[idx], item)
+	}
+
+	// Fast-path: if all URLs target the same shard, avoid spawning goroutines.
+	if len(buckets) == 1 {
+		for idx, urls := range buckets {
+			var errs []error
+			for _, u := range urls {
+				if err := f.shards[idx].Push(ctx, u); err != nil {
+					errs = append(errs, err)
+				}
+			}
+			return errors.Join(errs...)
 		}
 	}
-	return nil
+
+	var (
+		wg   sync.WaitGroup
+		mu   sync.Mutex
+		errs []error
+	)
+
+	for shardIdx, batch := range buckets {
+		wg.Add(1)
+		go func(idx int, urls []domain.NormalizedURL) {
+			defer wg.Done()
+			for _, u := range urls {
+				if err := f.shards[idx].Push(ctx, u); err != nil {
+					mu.Lock()
+					errs = append(errs, err)
+					mu.Unlock()
+				}
+			}
+		}(shardIdx, batch)
+	}
+
+	wg.Wait()
+	return errors.Join(errs...)
 }
 
-// Lease retrieves up to 'n' URLs ready for crawling.
-// It uses a round-robin algorithm across shards to ensure fair distribution
-// of work and prevent starvation of specific hosts.
+// Lease retrieves up to n URLs ready for crawling across all shards using round-robin order.
 func (f *Frontier) Lease(ctx context.Context, n int) ([]string, error) {
 	out := make([]string, 0, n)
 
@@ -85,18 +146,26 @@ func (f *Frontier) Lease(ctx context.Context, n int) ([]string, error) {
 	return out, nil
 }
 
-
-// Ack acknowledges successful processing of a URL.
-func (f *Frontier) Ack(ctx context.Context, url string) error {
-	return f.shards[f.hostToShard(hostOf(url))].Ack(ctx, url)
+// Ack acknowledges successful processing of a leased URL.
+func (f *Frontier) Ack(ctx context.Context, rawURL string) error {
+	return f.shards[f.hostToShard(hostOf(rawURL))].Ack(ctx, rawURL)
 }
 
-// Nack signals that processing of a URL failed.
-func (f *Frontier) Nack(ctx context.Context, url string) error {
-	return f.shards[f.hostToShard(hostOf(url))].Nack(ctx, url)
+// AckWithHash acknowledges successful processing of a leased URL and records its content fingerprint.
+func (f *Frontier) AckWithHash(ctx context.Context, rawURL string, contentHash uint64) error {
+	return f.shards[f.hostToShard(hostOf(rawURL))].AckWithHash(ctx, rawURL, contentHash)
 }
 
-// hostOf extracts the host component from a raw URL string.
+// Nack signals that processing of a leased URL failed and triggers retry/backoff logic.
+func (f *Frontier) Nack(ctx context.Context, rawURL string) error {
+	return f.shards[f.hostToShard(hostOf(rawURL))].Nack(ctx, rawURL)
+}
+
+// MarkDead permanently retires a URL and frees its metadata from active memory.
+func (f *Frontier) MarkDead(ctx context.Context, rawURL string) error {
+	return f.shards[f.hostToShard(hostOf(rawURL))].MarkDead(ctx, rawURL)
+}
+
 func hostOf(rawURL string) string {
 	u, err := url.Parse(rawURL)
 	if err != nil {

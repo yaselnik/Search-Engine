@@ -1,14 +1,13 @@
 package frontier
 
+// QueuedPage represents a URL entry inside a host's priority queue.
 type QueuedPage struct {
 	URL      string
 	priority float64
 }
 
-// PageQueue implements heap.Interface for *QueuedPage.
-// It acts as a Max-Heap sorted by QueuedPage.priority.
-// This ensures that higher-value pages (e.g., higher PageRank)
-// are fetched first within a specific host.
+// PageQueue implements heap.Interface as a max-heap ordered by QueuedPage.priority.
+// Higher-priority pages are dequeued first when the owning host becomes ready.
 type PageQueue []*QueuedPage
 
 func (pq PageQueue) Len() int { return len(pq) }

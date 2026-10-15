@@ -3,7 +3,12 @@ package frontier
 import (
 	"container/heap"
 	"context"
+	"hash/fnv"
 	"log/slog"
+	"math"
+	"math/rand/v2"
+	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -11,28 +16,30 @@ import (
 )
 
 const (
-	reaperInterval = 30 * time.Second
-	leaseTimeout   = 2 * time.Minute
+	// Multi-factor priority weights
+	newPageBaseUrgency = 5.0
+	waitingAgeFactor   = 0.1
+	depthSlashPenalty  = 0.15
+
+	crawlerTrapThreshold = 2000 // Warn when a single host accumulates too many queued URLs
 )
 
-// Shard represents an independent partition of the frontier state.
-// It manages its own mutex, host queues, and page queues, allowing
-// concurrent operations across different shards without blocking.
-//
-// Each shard runs a background [Shard.reaper] goroutine that monitors
-// in-flight pages and requeues them if they exceed the lease timeout,
-// ensuring fault tolerance against crashed crawler workers.
+// Shard represents an isolated partition of the Frontier state.
+// It manages per-host politeness timers, page priority queues, and a background
+// reaper goroutine that recovers stalled in-flight requests and schedules due refreshes.
 type Shard struct {
-	mu sync.Mutex
+	mu  sync.Mutex
+	id  int
+	cfg Config
 
-	pages map[string]*domain.FrontierItem
-	hosts map[string]*HostState
-
+	pages      map[string]*domain.FrontierItem
+	hosts      map[string]*HostState
 	hostsQueue HostsQueue
-	pageQueues map[string]*PageQueue // Maps hostnames to their url queues
+	pageQueues map[string]*PageQueue // Maps hostname -> priority queue of ready pages
 
-	inFlightHosts map[string]struct{}
-	inflightPages map[string]struct{}
+	inflightPages  map[string]struct{} // Pages currently leased to workers
+	scheduledPages map[string]struct{} // Pages in StateDone/StateFailed waiting for NextFetchAt
+	deadPages      map[uint64]struct{} // Compact 8-byte tombstones for retired/disallowed URLs
 
 	robots *RobotsCache
 	logger *slog.Logger
@@ -42,38 +49,83 @@ type Shard struct {
 	wg     sync.WaitGroup
 }
 
-// NewShard creates and starts a new Shard.
-// It automatically launches the background reaper goroutine.
+// NewShard creates and starts a Shard with default configuration.
 func NewShard(parentCtx context.Context, logger *slog.Logger) *Shard {
+	return NewShardWithConfig(parentCtx, 0, DefaultConfig(), nil, logger)
+}
+
+// NewShardWithConfig creates and starts a Shard with custom configuration.
+func NewShardWithConfig(parentCtx context.Context, id int, cfg Config, httpClient *http.Client, logger *slog.Logger) *Shard {
+	cfg = cfg.withDefaults()
+	if logger == nil {
+		logger = slog.Default()
+	}
 	ctx, cancel := context.WithCancel(parentCtx)
 	s := &Shard{
-		pages:         make(map[string]*domain.FrontierItem),
-		hosts:         make(map[string]*HostState),
-		pageQueues:    make(map[string]*PageQueue),
-		inFlightHosts: make(map[string]struct{}),
-		inflightPages: make(map[string]struct{}),
-		robots:        NewRobotsCache(nil, logger),
-		logger:        logger.With("component", "shard"),
-		ctx:           ctx,
-		cancel:        cancel,
+		id:             id,
+		cfg:            cfg,
+		pages:          make(map[string]*domain.FrontierItem),
+		hosts:          make(map[string]*HostState),
+		pageQueues:     make(map[string]*PageQueue),
+		inflightPages:  make(map[string]struct{}),
+		scheduledPages: make(map[string]struct{}),
+		deadPages:      make(map[uint64]struct{}),
+		robots:         NewRobotsCacheWithConfig(cfg, httpClient, logger),
+		logger:         logger.With("component", "shard", "shard_id", id),
+		ctx:            ctx,
+		cancel:         cancel,
 	}
 	s.wg.Add(1)
 	go s.reaper()
 	return s
 }
 
+// Close stops the background reaper goroutine and waits for it to exit.
 func (s *Shard) Close() {
-	s.logger.Info("Shard closed", "total hosts", len(s.hosts))
 	s.cancel()
 	s.wg.Wait()
+	s.mu.Lock()
+	s.logger.Debug("shard closed",
+		"total_hosts", len(s.hosts),
+		"active_pages", len(s.pages),
+		"dead_pages", len(s.deadPages),
+	)
+	s.mu.Unlock()
 }
 
-// reaper is a background loop that periodically checks for stalled in-flight pages.
-// If a page has been in-flight longer than leaseTimeout, it is considered failed
-// and is requeued with an incremented fail count.
+func (s *Shard) stats() (hosts, activePages, deadPages int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.hosts), len(s.pages), len(s.deadPages)
+}
+
+func urlFingerprint(rawURL string) uint64 {
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(rawURL))
+	return h.Sum64()
+}
+
+// retirePageLocked removes the full FrontierItem from memory and stores an 8-byte tombstone.
+func (s *Shard) retirePageLocked(rawURL string) {
+	delete(s.inflightPages, rawURL)
+	delete(s.scheduledPages, rawURL)
+	delete(s.pages, rawURL)
+	s.deadPages[urlFingerprint(rawURL)] = struct{}{}
+}
+
+func (s *Shard) isDead(rawURL string) bool {
+	fp := urlFingerprint(rawURL)
+	s.mu.Lock()
+	_, dead := s.deadPages[fp]
+	s.mu.Unlock()
+	return dead
+}
+
+// reaper periodically scans in-flight pages for lease timeouts and promotes
+// scheduled pages (StateDone or StateFailed) back into the active queue once NextFetchAt arrives.
 func (s *Shard) reaper() {
 	defer s.wg.Done()
-	t := time.NewTicker(reaperInterval)
+	t := time.NewTicker(s.cfg.ReaperInterval)
 	defer t.Stop()
 	for {
 		select {
@@ -90,7 +142,9 @@ func (s *Shard) requeue() {
 	defer s.mu.Unlock()
 
 	now := time.Now()
-	threshold := now.Add(-leaseTimeout)
+	threshold := now.Add(-s.cfg.LeaseTimeout)
+
+	// 1. Recover stalled in-flight pages that exceeded LeaseTimeout.
 	for url := range s.inflightPages {
 		page := s.pages[url]
 		if page.LastFetchAt.After(threshold) {
@@ -99,34 +153,75 @@ func (s *Shard) requeue() {
 		delete(s.inflightPages, url)
 		page.State = domain.StateFailed
 		page.FailCount++
-		page.NextFetchAt = now.Add(backoff(page.FailCount))
-		s.releaseHostLocked(page.Host)
+		host := page.Host
+
+		if page.FailCount <= s.cfg.MaxFailCount {
+			page.NextFetchAt = now.Add(backoff(page.FailCount))
+			s.scheduledPages[url] = struct{}{}
+			s.logger.Warn("page lease expired, scheduled for retry",
+				"url", page.URL,
+				"fail_count", page.FailCount,
+				"next_fetch_at", page.NextFetchAt,
+			)
+		} else {
+			s.retirePageLocked(url)
+			s.logger.Warn("page retired after max lease timeouts",
+				"url", url,
+				"fail_count", page.FailCount,
+			)
+		}
+		s.releaseHostLocked(host)
+	}
+
+	// 2. Enqueue pages whose scheduled refresh or retry time (NextFetchAt) has arrived.
+	for url := range s.scheduledPages {
+		page := s.pages[url]
+		if now.Before(page.NextFetchAt) {
+			continue
+		}
+		delete(s.scheduledPages, url)
 		s.enqueuePageLocked(page)
-		s.logger.Warn("Page requeued", "url", page.URL)
 	}
 }
 
-// Push adds a single URL to the shard's queue. It checks robots.txt rules,
-// initializes host state if necessary, and updates the page's priority.
+// Push adds or updates a URL in the shard. Dead or disallowed URLs are ignored without
+// keeping full FrontierItem structs in memory.
 func (s *Shard) Push(ctx context.Context, item domain.NormalizedURL) error {
+	if s.isDead(item.URL) {
+		return nil
+	}
 	allowed, delay := s.robots.GetRobots(ctx, item.Host, item.URL)
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	// double check
+	fp := urlFingerprint(item.URL)
+	if _, dead := s.deadPages[fp]; dead {
+		return nil
+	}
+
+	if !allowed {
+		s.retirePageLocked(item.URL)
+		s.logger.DebugContext(ctx, "url disallowed by robots.txt", "url", item.URL, "host", item.Host)
+		return nil
+	}
+
+	now := time.Now()
 
 	hs, ok := s.hosts[item.Host]
 	if !ok {
 		hs = &HostState{
 			name:       item.Host,
 			crawlDelay: delay,
-			readyAt:    time.Now(),
+			readyAt:    now,
 		}
 		s.hosts[item.Host] = hs
 		q := &PageQueue{}
 		heap.Init(q)
 		s.pageQueues[item.Host] = q
-		heap.Push(&s.hostsQueue, hs)
-		hs.inQueue = true
+	} else if delay > 0 {
+		hs.crawlDelay = delay
 	}
 
 	page, exists := s.pages[item.URL]
@@ -135,22 +230,22 @@ func (s *Shard) Push(ctx context.Context, item domain.NormalizedURL) error {
 			URL:          item.URL,
 			Host:         item.Host,
 			State:        domain.StateNew,
-			LastFetchAt:  time.Time{},
-			DiscoveredAt: time.Now(),
+			PageRank:     1,
+			DiscoveredAt: now,
 		}
 		s.pages[item.URL] = page
 	} else {
 		page.PageRank++
 	}
 
-	if !allowed {
-		page.State = domain.StateNotAllowed
-		return nil
-	}
-
 	switch page.State {
-	case domain.StateQueued, domain.StateInFlight, domain.StateNotAllowed:
+	case domain.StateQueued, domain.StateInFlight:
 		return nil
+	case domain.StateDone, domain.StateFailed:
+		if now.Before(page.NextFetchAt) {
+			return nil
+		}
+		delete(s.scheduledPages, item.URL)
 	}
 
 	s.enqueuePageLocked(page)
@@ -158,33 +253,41 @@ func (s *Shard) Push(ctx context.Context, item domain.NormalizedURL) error {
 }
 
 func (s *Shard) enqueuePageLocked(page *domain.FrontierItem) {
-	page.Priority = countPagePriority(page)
+	now := time.Now()
+	page.Priority = s.countPagePriority(page, now)
 
-	heap.Push(s.pageQueues[page.Host], &QueuedPage{
+	q := s.pageQueues[page.Host]
+	heap.Push(q, &QueuedPage{
 		URL:      page.URL,
 		priority: page.Priority,
 	})
 
+	if q.Len() == crawlerTrapThreshold {
+		s.logger.Warn("host queue exceeded threshold, potential crawler trap",
+			"host", page.Host,
+			"queue_len", q.Len(),
+		)
+	}
+
 	page.State = domain.StateQueued
 
 	hs := s.hosts[page.Host]
-	if !hs.inQueue {
-		hs.readyAt = time.Now()
+	// Only place the host in HostsQueue if it is not already queued and has no active in-flight request.
+	if !hs.inQueue && !hs.inFlight {
+		earliestReady := hs.lastReq.Add(hs.crawlDelay)
+		if now.After(earliestReady) {
+			hs.readyAt = now
+		} else {
+			hs.readyAt = earliestReady
+		}
 		heap.Push(&s.hostsQueue, hs)
 		hs.inQueue = true
 	}
 }
 
-// ToDo: a fair heuristic estimate
-func countPagePriority(page *domain.FrontierItem) float64 {
-	p := float64(page.PageRank)
-	return p
-}
-
-
-// Lease extracts up to 'n' pages from the shard that are ready to be fetched.
-// A page is considered ready if its host's crawl-delay timer has expired.
-// Leased pages are marked as in-flight.
+// Lease pops up to n ready URLs from hosts whose Crawl-Delay has expired.
+// Each leased host is marked as inFlight until Ack, Nack, or lease expiration,
+// guaranteeing at most one concurrent request per host.
 func (s *Shard) Lease(ctx context.Context, n int) ([]string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -198,30 +301,36 @@ func (s *Shard) Lease(ctx context.Context, n int) ([]string, error) {
 			break
 		}
 
-		q := s.pageQueues[top.name]
-		if q.Len() == 0 {
-			heap.Pop(&s.hostsQueue)
-			top.inQueue = false
-			continue
-		}
-
 		heap.Pop(&s.hostsQueue)
 		top.inQueue = false
 
+		q := s.pageQueues[top.name]
+		if q.Len() == 0 {
+			continue
+		}
+
 		page := heap.Pop(q).(*QueuedPage)
-		s.pages[page.URL].State = domain.StateInFlight
-		s.pages[page.URL].LastFetchAt = now
+		item := s.pages[page.URL]
+		item.State = domain.StateInFlight
+		item.LastFetchAt = now
 		s.inflightPages[page.URL] = struct{}{}
 
-		top.readyAt = now.Add(top.crawlDelay)
+		top.inFlight = true
+		top.lastReq = now
 
 		out = append(out, page.URL)
 	}
 	return out, nil
 }
 
-// Ack marks a leased page as done and resets the host's rate-limit timer.
+// Ack marks an in-flight URL as successfully processed and schedules its next refresh.
 func (s *Shard) Ack(ctx context.Context, url string) error {
+	return s.AckWithHash(ctx, url, 0)
+}
+
+// AckWithHash marks an in-flight URL as successfully processed, updates content change
+// metrics based on contentHash, and schedules the next refresh interval.
+func (s *Shard) AckWithHash(ctx context.Context, url string, contentHash uint64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -230,20 +339,31 @@ func (s *Shard) Ack(ctx context.Context, url string) error {
 	}
 	delete(s.inflightPages, url)
 
+	now := time.Now()
 	page := s.pages[url]
-	page.LastFetchAt = time.Now()
+	page.LastFetchAt = now
 	page.FetchCount++
+	page.FailCount = 0
 	page.State = domain.StateDone
-	page.NextFetchAt = page.LastFetchAt.Add(nextInterval(page))
+
+	if contentHash != 0 {
+		if page.ContentHash != 0 && page.ContentHash != contentHash {
+			page.ChangeCount++
+		}
+		page.ContentHash = contentHash
+	}
+
+	page.NextFetchAt = now.Add(s.nextInterval(page))
+	s.scheduledPages[url] = struct{}{}
 
 	s.releaseHostLocked(page.Host)
-	//s.enqueuePageLocked(page)
 	return nil
 }
 
-// Nack marks a leased page as failed and schedules it for retry.
+// Nack marks an in-flight URL as failed. If FailCount has not exceeded MaxFailCount,
+// the page is scheduled for retry with exponential backoff and jitter; otherwise it is retired.
 func (s *Shard) Nack(ctx context.Context, url string) error {
-	s.mu.Lock()
+s.mu.Lock()
 	defer s.mu.Unlock()
 
 	if _, ok := s.inflightPages[url]; !ok {
@@ -251,14 +371,48 @@ func (s *Shard) Nack(ctx context.Context, url string) error {
 	}
 	delete(s.inflightPages, url)
 
+	now := time.Now()
 	page := s.pages[url]
-	page.LastFetchAt = time.Now()
+	page.LastFetchAt = now
 	page.FailCount++
 	page.State = domain.StateFailed
-	page.NextFetchAt = page.LastFetchAt.Add(backoff(page.FailCount))
+	host := page.Host
 
-	s.releaseHostLocked(page.Host)
-	s.enqueuePageLocked(page)
+	if page.FailCount <= s.cfg.MaxFailCount {
+		page.NextFetchAt = now.Add(backoff(page.FailCount))
+		s.scheduledPages[url] = struct{}{}
+	} else {
+		s.retirePageLocked(url)
+		s.logger.WarnContext(ctx, "page retired after exceeding max fail count",
+			"url", url,
+			"fail_count", page.FailCount,
+		)
+	}
+
+	s.releaseHostLocked(host)
+	return nil
+}
+
+// MarkDead immediately retires a URL (e.g., on HTTP 404/410/403 or unsupported MIME type),
+// freeing its FrontierItem memory and leaving an 8-byte tombstone so it is not recrawled.
+func (s *Shard) MarkDead(ctx context.Context, url string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var host string
+	if page, ok := s.pages[url]; ok {
+		host = page.Host
+	} else {
+		host = hostOf(url)
+	}
+
+	_, wasInFlight := s.inflightPages[url]
+	s.retirePageLocked(url)
+
+	if wasInFlight && host != "" {
+		s.releaseHostLocked(host)
+	}
+	s.logger.DebugContext(ctx, "page marked dead and retired", "url", url, "host", host)
 	return nil
 }
 
@@ -268,20 +422,74 @@ func (s *Shard) releaseHostLocked(host string) {
 		return
 	}
 
-	hs.readyAt = time.Now().Add(hs.crawlDelay)
-	if !hs.inQueue {
+	now := time.Now()
+	hs.inFlight = false
+	hs.lastReq = now
+	hs.readyAt = now.Add(hs.crawlDelay)
+
+	// Re-insert the host into HostsQueue only if it still has queued pages waiting.
+	if !hs.inQueue && s.pageQueues[host].Len() > 0 {
 		heap.Push(&s.hostsQueue, hs)
 		hs.inQueue = true
 	}
 }
 
-// ToDo: a fair heuristic estimate
-func nextInterval(page *domain.FrontierItem) time.Duration {
-	base := 24 * time.Hour
-	return base
+// countPagePriority computes a page's crawl priority combining:
+//  1. Log-smoothed link importance (PageRank / in-degree)
+//  2. Novelty boost for uncrawled pages or Poisson staleness urgency for recrawls
+//  3. Quadratic penalty for consecutive fetch failures
+//  4. Structural URL depth penalty to mitigate crawler traps
+func (s *Shard) countPagePriority(page *domain.FrontierItem, now time.Time) float64 {
+	importance := 1.0 + math.Log1p(float64(page.PageRank))
+
+	var urgency float64
+	if page.FetchCount == 0 {
+		waitHours := math.Max(0, now.Sub(page.DiscoveredAt).Hours())
+		urgency = newPageBaseUrgency + waitingAgeFactor*waitHours
+	} else {
+		changeRate := estimateChangeRate(page)
+		interval := s.nextInterval(page)
+		elapsed := math.Max(0, float64(now.Sub(page.LastFetchAt)))
+		stalenessProb := 1.0 - math.Exp(-elapsed/float64(interval))
+		urgency = (1.0 + changeRate) * stalenessProb
+	}
+
+	failPenalty := 1.0 / (1.0 + float64(page.FailCount*page.FailCount))
+
+	slashes := strings.Count(page.URL, "/")
+	extraDepth := math.Max(0, float64(slashes-3))
+	depthPenalty := 1.0 / (1.0 + depthSlashPenalty*extraDepth)
+
+	return importance * urgency * failPenalty * depthPenalty
 }
 
-// ToDo: a fair heuristic estimate
+// estimateChangeRate computes the Laplace-smoothed empirical change frequency of a page.
+func estimateChangeRate(page *domain.FrontierItem) float64 {
+	return float64(page.ChangeCount+1) / float64(page.FetchCount+2)
+}
+
+// nextInterval computes an adaptive recrawl interval bounded by [MinRefreshInterval, MaxRefreshInterval].
+func (s *Shard) nextInterval(page *domain.FrontierItem) time.Duration {
+	if page.FetchCount == 0 {
+		return s.cfg.BaseRefreshInterval
+	}
+
+	changeRate := estimateChangeRate(page)
+	importanceBoost := 1.0 + 0.25*math.Log1p(float64(page.PageRank))
+	scale := (1.0 - 0.75*changeRate) / importanceBoost
+
+	interval := time.Duration(float64(s.cfg.BaseRefreshInterval) * scale)
+	if interval < s.cfg.MinRefreshInterval {
+		return s.cfg.MinRefreshInterval
+	}
+	if interval > s.cfg.MaxRefreshInterval {
+		return s.cfg.MaxRefreshInterval
+	}
+	return interval
+}
+
+// backoff computes an exponential retry delay (2^fails minutes, capped at 64m)
+// with +/-20% uniform jitter to prevent synchronized retry storms.
 func backoff(fails int) time.Duration {
 	if fails < 1 {
 		fails = 1
@@ -289,5 +497,8 @@ func backoff(fails int) time.Duration {
 	if fails > 6 {
 		fails = 6
 	}
-	return time.Duration(1<<fails) * time.Minute
+	base := float64(time.Duration(1<<fails) * time.Minute)
+	// Jitter in range [0.8 * base, 1.2 * base]
+	jitter := 0.8 + 0.4*rand.Float64()
+	return time.Duration(base * jitter)
 }

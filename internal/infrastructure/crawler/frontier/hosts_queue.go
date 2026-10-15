@@ -2,19 +2,18 @@ package frontier
 
 import "time"
 
-// HostState tracks the crawling state and rate-limiting metrics for a specific host.
+// HostState tracks politeness constraints and scheduling state for a single host.
 type HostState struct {
 	name       string
 	lastReq    time.Time
 	crawlDelay time.Duration
 	readyAt    time.Time
-	inQueue    bool
+	inQueue    bool // true when the host is currently present in HostsQueue
+	inFlight   bool // true while a worker holds an active lease for this host
 }
 
-// HostsQueue implements heap.Interface for *HostState.
-// It acts as a Min-Heap sorted by HostState.readyAt.
-// This ensures that the crawler always attempts to fetch from the host
-// that has been waiting the longest past its crawl-delay.
+// HostsQueue implements heap.Interface as a min-heap ordered by HostState.readyAt.
+// The host whose politeness timer expires earliest is always at the root of the heap.
 type HostsQueue []*HostState
 
 func (pq HostsQueue) Len() int { return len(pq) }
