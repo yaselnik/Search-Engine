@@ -160,7 +160,7 @@ func (c *RobotsCache) load(ctx context.Context, scheme, host string, e *robotsEn
 
 	resp, err := c.client.Do(req)
 	if err != nil {
-		c.logger.Warn("robots fetch failed", "host", host, "error", err)
+		c.logger.DebugContext(ctx, "robots fetch failed, using default policy", "host", host, "error", err)
 		fetchErr = err
 		expiresAt = time.Now().Add(c.failedRetry)
 		return
@@ -179,7 +179,7 @@ func (c *RobotsCache) load(ctx context.Context, scheme, host string, e *robotsEn
 		expiresAt = time.Now().Add(c.failedRetry)
 		return
 	}
-	c.logger.Debug("robots loaded", "host", host)
+	c.logger.DebugContext(ctx, "robots loaded", "host", host)
 }
 
 // GetRobots checks whether rawURL is allowed to be crawled according to the host's
