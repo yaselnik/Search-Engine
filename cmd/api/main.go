@@ -18,6 +18,7 @@ import (
 	"github.com/yaselnik/Search-Engine/internal/infrastructure/crawler/fetcher"
 	"github.com/yaselnik/Search-Engine/internal/infrastructure/crawler/frontier"
 	parserHTML "github.com/yaselnik/Search-Engine/internal/infrastructure/crawler/parser"
+	"github.com/yaselnik/Search-Engine/internal/infrastructure/crawler/urlfilter"
 	"github.com/yaselnik/Search-Engine/internal/infrastructure/index"
 	"github.com/yaselnik/Search-Engine/internal/infrastructure/ranker"
 	"github.com/yaselnik/Search-Engine/internal/infrastructure/storage"
@@ -107,6 +108,7 @@ func main() {
 	stemmer := stemmer.NewMultiLanguageStemmer(engStemmer, stemmer.NoopStemmer{})
 	analyzer := analyzer.NewAnalyzer(analyzer.RegexpTokenize, analyzer.LowercaseFilter{}, stemmer)
 
+	urlFilter := urlfilter.NewFilter()
 	crFetcher := fetcher.NewFetcher(nil, "SearchEngineBot/0.1")
 	crParser := parserHTML.NewParser()
 	crFrontier := frontier.NewFrontier(ctx, 0, logger)
@@ -119,12 +121,11 @@ func main() {
 	logger.Info("seeds pushed", "count", len(SeedURLs))
 
 	cr := crawler.NewCrawler(
-		crFrontier, crFetcher, crParser, docStorage,
+		urlFilter, crFrontier, crFetcher, crParser, docStorage,
 		crawler.Options{
 			FetcherWorkers: 20,
 			ParserWorkers:  12,
 			MaxPages:       10000,
-			SameHost:       false,
 			RawBufferSize:  500,
 		},
 		logger)

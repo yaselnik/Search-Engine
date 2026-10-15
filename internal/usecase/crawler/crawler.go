@@ -4,7 +4,6 @@ import (
 	"context"
 	"hash/fnv"
 	"log/slog"
-	"net/url"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -16,15 +15,15 @@ type Options struct {
 	FetcherWorkers int
 	ParserWorkers  int
 	MaxPages       int
-	SameHost       bool
 	RawBufferSize  int
 }
 
 type Crawler struct {
-	frontier domain.IFrontier
-	fetcher  domain.Fetcher
-	parser   domain.Parser
-	storage  domain.DocumentStorage
+	urlFilter domain.URLFilter
+	frontier  domain.IFrontier
+	fetcher   domain.Fetcher
+	parser    domain.Parser
+	storage   domain.DocumentStorage
 
 	logger *slog.Logger
 	opts   Options
@@ -38,6 +37,7 @@ type Crawler struct {
 }
 
 func NewCrawler(
+	filter domain.URLFilter,
 	frontier domain.IFrontier,
 	fetcher domain.Fetcher,
 	parser domain.Parser,
@@ -59,13 +59,14 @@ func NewCrawler(
 	}
 
 	return &Crawler{
-		frontier: frontier,
-		fetcher:  fetcher,
-		parser:   parser,
-		storage:  storage,
-		logger:   logger.With("component", "crawler"),
-		opts:     opts,
-		rawPages: make(chan *domain.FetchedPage, opts.RawBufferSize),
+		urlFilter: filter,
+		frontier:  frontier,
+		fetcher:   fetcher,
+		parser:    parser,
+		storage:   storage,
+		logger:    logger.With("component", "crawler"),
+		opts:      opts,
+		rawPages:  make(chan *domain.FetchedPage, opts.RawBufferSize),
 	}
 }
 
@@ -187,7 +188,6 @@ func (c *Crawler) runFetcher(ctx context.Context, _ int) {
 	}
 }
 
-
 func (c *Crawler) runParser(ctx context.Context) {
 	for {
 		select {
@@ -222,21 +222,7 @@ func (c *Crawler) parseOne(ctx context.Context, page *domain.FetchedPage) {
 		return
 	}
 
-	baseHost := hostOf(page.URL)
-	var newItems []domain.NormalizedURL
-	for _, link := range parsed.Links {
-		if c.opts.SameHost && hostOf(link) != baseHost {
-			continue
-		}
-		newItems = append(newItems, domain.NormalizedURL{
-			URL:  link,
-			Host: hostOf(link),
-		})
-	}
-	for len(newItems) > 10 {
-		_ = c.frontier.Push(ctx, newItems[:10])
-		newItems = newItems[10:]
-	}
+	newItems := c.urlFilter.ProcessLinks(page.FinalURL, parsed.Links)
 	_ = c.frontier.Push(ctx, newItems)
 }
 
@@ -255,14 +241,6 @@ func toDocument(p *domain.ParsedPage) domain.Document {
 		CreatedAt: now,
 		UpdatedAt: now,
 	}
-}
-
-func hostOf(rawURL string) string {
-	u, err := url.Parse(rawURL)
-	if err != nil {
-		return ""
-	}
-	return u.Host
 }
 
 func idFromURL(u string) domain.DocID {

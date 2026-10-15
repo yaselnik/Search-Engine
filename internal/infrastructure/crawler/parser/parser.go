@@ -1,8 +1,8 @@
 package parser
 
 import (
+	"bytes"
 	"context"
-	"net/url"
 	"strings"
 
 	"github.com/yaselnik/Search-Engine/internal/domain"
@@ -16,17 +16,16 @@ type Parser struct{}
 func NewParser() *Parser { return &Parser{} }
 
 func (p *Parser) Parse(ctx context.Context, page *domain.FetchedPage) (*domain.ParsedPage, error) {
-    doc, err := html.Parse(strings.NewReader(string(page.Body)))
-    if err != nil {
-        return nil, err
-    }
-    base, _ := url.Parse(page.FinalURL)
-    return &domain.ParsedPage{
-        URL:   page.URL,
-        Title: extractTitle(doc),
-        Text:  extractText(doc),
-        Links: extractLinks(doc, base),
-    }, nil
+	doc, err := html.Parse(bytes.NewReader(page.Body))
+	if err != nil {
+		return nil, err
+	}
+	return &domain.ParsedPage{
+		URL:   page.URL,
+		Title: extractTitle(doc),
+		Text:  extractText(doc),
+		Links: extractLinks(doc),
+	}, nil
 }
 
 
@@ -72,27 +71,21 @@ func extractText(n *html.Node) string {
     return strings.TrimSpace(sb.String())
 }
 
-func extractLinks(n *html.Node, base *url.URL) []string {
-    var links []string
-    var walk func(*html.Node)
-    walk = func(n *html.Node) {
-        if n.Type == html.ElementNode && n.Data == "a" {
-            for _, a := range n.Attr {
-                if a.Key == "href" {
-                    ref, err := url.Parse(a.Val)
-                    if err != nil { continue }
-                    abs := base.ResolveReference(ref)
-                    if abs.Scheme == "http" || abs.Scheme == "https" {
-                        abs.Fragment = ""
-                        links = append(links, abs.String())
-                    }
-                }
-            }
-        }
-        for c := n.FirstChild; c != nil; c = c.NextSibling {
-            walk(c)
-        }
-    }
-    walk(n)
-    return links
+func extractLinks(n *html.Node) []string {
+	var links []string
+	var walk func(*html.Node)
+	walk = func(n *html.Node) {
+		if n.Type == html.ElementNode && n.Data == "a" {
+			for _, a := range n.Attr {
+				if a.Key == "href" && a.Val != "" {
+					links = append(links, a.Val)
+				}
+			}
+		}
+		for c := n.FirstChild; c != nil; c = c.NextSibling {
+			walk(c)
+		}
+	}
+	walk(n)
+	return links
 }
