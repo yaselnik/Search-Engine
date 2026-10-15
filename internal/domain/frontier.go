@@ -5,40 +5,42 @@ import (
 	"time"
 )
 
-type IFrontier interface {
-	Push(ctx context.Context, items []NormalizedURL) error
-	Lease(ctx context.Context, n int) ([]string, error)
-	Ack(ctx context.Context, url string) error
-	Nack(ctx context.Context, url string) error
-}
-
-type FrontierItemState int8
+type PageState int
 
 const (
-	StateNew FrontierItemState = iota
+	StateNew PageState = iota
 	StateQueued
 	StateInFlight
 	StateDone
 	StateFailed
-	StateNotAllowed
 )
-
-type FrontierItem struct {
-	URL          string
-	Host         string
-	State        FrontierItemState
-	Priority     float64
-	LastFetchAt  time.Time
-	NextFetchAt  time.Time
-	FetchCount   int
-	FailCount    int
-	LastResp     int
-	ChangeFreq   time.Duration
-	DiscoveredAt time.Time
-	PageRank     int
-}
 
 type NormalizedURL struct {
 	URL  string
 	Host string
+}
+
+type FrontierItem struct {
+	URL          string
+	Host         string
+	State        PageState
+	Priority     float64
+	PageRank     int
+	FetchCount   int
+	ChangeCount  int
+	ContentHash  uint64
+	FailCount    int
+	DiscoveredAt time.Time
+	LastFetchAt  time.Time
+	NextFetchAt  time.Time
+}
+
+type IFrontier interface {
+	Push(ctx context.Context, items []NormalizedURL) error
+	Lease(ctx context.Context, n int) ([]string, error)
+	Ack(ctx context.Context, url string) error
+	AckWithHash(ctx context.Context, url string, contentHash uint64) error
+	Nack(ctx context.Context, url string) error
+	MarkDead(ctx context.Context, url string) error
+	Close()
 }
