@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"flag"
+	"io"
+	"log"
 	"log/slog"
 	"net/http"
 	"os"
@@ -95,6 +97,8 @@ func main() {
 		Level: level,
 	}))
 	slog.SetDefault(logger)
+	// Suppress internal net/http HTTP/2 frame diagnostic logs written to the standard log package.
+	log.SetOutput(io.Discard)
 
 	logger.Info("starting search engine", "log_level", level.String())
 
@@ -109,24 +113,31 @@ func main() {
 	analyzer := analyzer.NewAnalyzer(analyzer.RegexpTokenize, analyzer.LowercaseFilter{}, stemmer)
 
 	urlFilter := urlfilter.NewFilter()
-	crFetcher := fetcher.NewFetcher(nil, "SearchEngineBot/0.1")
+	crFetcher := fetcher.NewFetcher(nil, "Polzun/1.0")
 	crParser := parserHTML.NewParser()
 	crFrontier := frontier.NewFrontier(ctx, 0, logger)
 	defer crFrontier.Close()
 
-	if err := crFrontier.Push(ctx, SeedURLs); err != nil {
+	normalizedSeeds := make([]domain.NormalizedURL, 0, len(SeedURLs))
+	for _, seed := range SeedURLs {
+		if norm, ok := urlFilter.Normalize(seed.URL); ok {
+			normalizedSeeds = append(normalizedSeeds, norm)
+		}
+	}
+
+	if err := crFrontier.Push(ctx, normalizedSeeds); err != nil {
 		logger.Error("seed push failed", "error", err)
 		return
 	}
-	logger.Info("seeds pushed", "count", len(SeedURLs))
+	logger.Info("seeds pushed", "count", len(normalizedSeeds))
 
 	cr := crawler.NewCrawler(
 		urlFilter, crFrontier, crFetcher, crParser, docStorage,
-		crawler.Options{
+		crawler.Config{
 			FetcherWorkers: 20,
 			ParserWorkers:  12,
 			MaxPages:       100000,
-			RawBufferSize:  500,
+			RawBufferSize:  1000,
 		},
 		logger)
 

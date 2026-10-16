@@ -12,7 +12,7 @@ import (
 	"github.com/yaselnik/Search-Engine/internal/domain"
 )
 
-type Options struct {
+type Config struct {
 	FetcherWorkers int
 	ParserWorkers  int
 	MaxPages       int
@@ -27,14 +27,13 @@ type Crawler struct {
 	storage   domain.DocumentStorage
 
 	logger *slog.Logger
-	opts   Options
+	opts   Config
 
 	rawPages chan *domain.FetchedPage
 
 	loaded        atomic.Int64
 	inflight      atomic.Int64
 	activeParsers atomic.Int64
-	mu            sync.Mutex
 }
 
 func NewCrawler(
@@ -43,7 +42,7 @@ func NewCrawler(
 	fetcher domain.Fetcher,
 	parser domain.Parser,
 	storage domain.DocumentStorage,
-	opts Options,
+	opts Config,
 	logger *slog.Logger,
 ) *Crawler {
 	if opts.FetcherWorkers <= 0 {
@@ -116,7 +115,7 @@ func (c *Crawler) Start(ctx context.Context) (int, error) {
 			}
 
 			progressTicks++
-			if progressTicks >= 20 { // Каждые 10 секунд (20 * 500ms)
+			if progressTicks >= 20 {
 				progressTicks = 0
 				elapsed := time.Since(startTime).Seconds()
 				rate := 0.0
@@ -186,11 +185,7 @@ func (c *Crawler) runFetcher(ctx context.Context, _ int) {
 		}
 
 		URL := URLs[0]
-		if c.shouldStop() {
-			_ = c.frontier.Nack(ctx, URL)
-			return
-		}
-
+		
 		c.inflight.Add(1)
 		page, err := c.fetcher.Fetch(ctx, URL)
 		if err != nil {
@@ -250,12 +245,14 @@ func (c *Crawler) parseOne(ctx context.Context, page *domain.FetchedPage) {
 		return
 	}
 
-	doc := toDocument(parsed)
-	if err := c.storage.Add(ctx, doc); err != nil {
-		c.logger.Error("storage failed", "url", parsed.URL, "error", err)
-		return
+	if !parsed.NoIndex {
+		doc := toDocument(parsed)
+		if err := c.storage.Add(ctx, doc); err != nil {
+			c.logger.Error("storage failed", "url", parsed.URL, "error", err)
+			return
+		}
+		c.loaded.Add(1)
 	}
-	c.loaded.Add(1)
 
 	if c.shouldStop() {
 		return
