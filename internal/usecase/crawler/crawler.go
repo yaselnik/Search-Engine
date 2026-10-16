@@ -2,6 +2,7 @@ package crawler
 
 import (
 	"context"
+	"errors"
 	"hash/fnv"
 	"log/slog"
 	"sync"
@@ -97,6 +98,9 @@ func (c *Crawler) Start(ctx context.Context) (int, error) {
 		defer ticker.Stop()
 
 		idleTicks := 0
+		progressTicks := 0
+		startTime := time.Now()
+
 		for {
 			select {
 			case <-ctx.Done():
@@ -104,10 +108,29 @@ func (c *Crawler) Start(ctx context.Context) (int, error) {
 			case <-ticker.C:
 			}
 
-			if c.loaded.Load() >= int64(c.opts.MaxPages) {
-				c.logger.Info("max pages reached", "loaded", c.loaded.Load())
+			loaded := c.loaded.Load()
+			if loaded >= int64(c.opts.MaxPages) {
+				c.logger.Info("max pages reached", "loaded", loaded)
 				cancel()
 				return
+			}
+
+			progressTicks++
+			if progressTicks >= 20 { // Каждые 10 секунд (20 * 500ms)
+				progressTicks = 0
+				elapsed := time.Since(startTime).Seconds()
+				rate := 0.0
+				if elapsed > 0 {
+					rate = float64(loaded) / elapsed
+				}
+				c.logger.Info("crawler progress",
+					"loaded", loaded,
+					"max_pages", c.opts.MaxPages,
+					"pages_per_sec", int(rate*10)/10,
+					"inflight_fetches", c.inflight.Load(),
+					"active_parsers", c.activeParsers.Load(),
+					"raw_buffer_len", len(c.rawPages),
+				)
 			}
 
 			empty := c.inflight.Load() == 0 &&
@@ -146,9 +169,10 @@ func (c *Crawler) runFetcher(ctx context.Context, _ int) {
 		default:
 		}
 
-		URLs, err := c.frontier.Lease(ctx, 10)
+		// Lease 1 URL per synchronous worker so other hosts are not held idle in-flight.
+		URLs, err := c.frontier.Lease(ctx, 1)
 		if err != nil {
-			c.logger.Error("frontier lease failed", "error", err)
+			c.logger.ErrorContext(ctx, "frontier lease failed", "error", err)
 			time.Sleep(time.Second)
 			continue
 		}
@@ -156,35 +180,50 @@ func (c *Crawler) runFetcher(ctx context.Context, _ int) {
 			select {
 			case <-ctx.Done():
 				return
-			case <-time.After(200 * time.Millisecond):
+			case <-time.After(100 * time.Millisecond):
 			}
 			continue
 		}
 
-		for _, URL := range URLs {
-			if c.shouldStop() {
-				c.inflight.Add(-1)
-				_ = c.frontier.Nack(ctx, URL)
-				return
-			}
-			c.inflight.Add(1)
-			page, err := c.fetcher.Fetch(ctx, URL)
-			if err != nil {
-				c.inflight.Add(-1)
-				c.logger.Warn("fetch failed", "url", URL, "error", err)
-				_ = c.frontier.Nack(ctx, URL)
-				continue
-			}
-
-			select {
-			case c.rawPages <- page:
-				_ = c.frontier.Ack(ctx, URL)
-			case <-ctx.Done():
-				c.inflight.Add(-1)
-				return
-			}
-			c.inflight.Add(-1)
+		URL := URLs[0]
+		if c.shouldStop() {
+			_ = c.frontier.Nack(ctx, URL)
+			return
 		}
+
+		c.inflight.Add(1)
+		page, err := c.fetcher.Fetch(ctx, URL)
+		if err != nil {
+			c.inflight.Add(-1)
+			if errors.Is(err, domain.ErrPermanentFetchFailure) {
+				c.logger.DebugContext(ctx, "permanent fetch failure, marking URL dead", "url", URL, "error", err)
+				_ = c.frontier.MarkDead(ctx, URL)
+			} else {
+				c.logger.DebugContext(ctx, "transient fetch failure, scheduling retry", "url", URL, "error", err)
+				_ = c.frontier.Nack(ctx, URL)
+			}
+			continue
+		}
+
+		shouldProcess, err := c.frontier.AckWithHash(ctx, URL, page.ContentHash)
+		if err != nil {
+			c.inflight.Add(-1)
+			c.logger.DebugContext(ctx, "frontier ack failed", "url", URL, "error", err)
+			continue
+		}
+		if !shouldProcess {
+			// Content is either unchanged since last crawl or a duplicate of another URL.
+			c.inflight.Add(-1)
+			continue
+		}
+
+		select {
+		case c.rawPages <- page:
+		case <-ctx.Done():
+			c.inflight.Add(-1)
+			return
+		}
+		c.inflight.Add(-1)
 	}
 }
 

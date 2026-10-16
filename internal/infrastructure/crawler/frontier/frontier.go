@@ -151,8 +151,9 @@ func (f *Frontier) Ack(ctx context.Context, rawURL string) error {
 	return f.shards[f.hostToShard(hostOf(rawURL))].Ack(ctx, rawURL)
 }
 
-// AckWithHash acknowledges successful processing of a leased URL and records its content fingerprint.
-func (f *Frontier) AckWithHash(ctx context.Context, rawURL string, contentHash uint64) error {
+// AckWithHash acknowledges successful processing of a leased URL, records its content fingerprint,
+// and returns true if the page should be parsed and indexed.
+func (f *Frontier) AckWithHash(ctx context.Context, rawURL string, contentHash uint64) (bool, error) {
 	return f.shards[f.hostToShard(hostOf(rawURL))].AckWithHash(ctx, rawURL, contentHash)
 }
 

@@ -110,7 +110,7 @@ func TestFrontier_PriorityOrderingAndDeduplication(t *testing.T) {
 	if len(leased) != 1 || leased[0] != "https://go.dev/shallow" {
 		t.Fatalf("expected shallow URL to be prioritized first, got %v", leased)
 	}
-	_ = f.AckWithHash(ctx, leased[0], 12345)
+	_, _ = f.AckWithHash(ctx, leased[0], 12345)
 
 	_ = f.Push(ctx, []domain.NormalizedURL{
 		{URL: "https://go.dev/shallow", Host: "go.dev"},

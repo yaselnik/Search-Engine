@@ -125,7 +125,7 @@ func main() {
 		crawler.Options{
 			FetcherWorkers: 20,
 			ParserWorkers:  12,
-			MaxPages:       10000,
+			MaxPages:       100000,
 			RawBufferSize:  500,
 		},
 		logger)
@@ -165,16 +165,13 @@ func main() {
 				logger.Info("background indexer stopped")
 				return
 			case <-ticker.C:
-				n, err := indexerUC.IndexNew(ctx)
+				_, err := indexerUC.IndexNew(ctx)
 				if err != nil {
 					if errors.Is(err, context.Canceled) {
 						return
 					}
 					logger.Warn("indexer tick failed", "error", err)
 					continue
-				}
-				if n > 0 {
-					logger.Info("indexed new documents", "count", n)
 				}
 			}
 		}

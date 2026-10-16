@@ -20,8 +20,6 @@ const (
 	newPageBaseUrgency = 5.0
 	waitingAgeFactor   = 0.1
 	depthSlashPenalty  = 0.15
-
-	crawlerTrapThreshold = 2000 // Warn when a single host accumulates too many queued URLs
 )
 
 // Shard represents an isolated partition of the Frontier state.
@@ -40,6 +38,7 @@ type Shard struct {
 	inflightPages  map[string]struct{} // Pages currently leased to workers
 	scheduledPages map[string]struct{} // Pages in StateDone/StateFailed waiting for NextFetchAt
 	deadPages      map[uint64]struct{} // Compact 8-byte tombstones for retired/disallowed URLs
+	contentOwners  map[uint64]string   // Maps 64-bit content hash -> canonical owner URL (Content-Seen test)
 
 	robots *RobotsCache
 	logger *slog.Logger
@@ -70,6 +69,7 @@ func NewShardWithConfig(parentCtx context.Context, id int, cfg Config, httpClien
 		inflightPages:  make(map[string]struct{}),
 		scheduledPages: make(map[string]struct{}),
 		deadPages:      make(map[uint64]struct{}),
+		contentOwners: make(map[uint64]string),
 		robots:         NewRobotsCacheWithConfig(cfg, httpClient, logger),
 		logger:         logger.With("component", "shard", "shard_id", id),
 		ctx:            ctx,
@@ -107,6 +107,11 @@ func urlFingerprint(rawURL string) uint64 {
 
 // retirePageLocked removes the full FrontierItem from memory and stores an 8-byte tombstone.
 func (s *Shard) retirePageLocked(rawURL string) {
+	if page, ok := s.pages[rawURL]; ok && page.ContentHash != 0 {
+		if owner, exists := s.contentOwners[page.ContentHash]; exists && owner == rawURL {
+			delete(s.contentOwners, page.ContentHash)
+		}
+	}
 	delete(s.inflightPages, rawURL)
 	delete(s.scheduledPages, rawURL)
 	delete(s.pages, rawURL)
@@ -226,6 +231,9 @@ func (s *Shard) Push(ctx context.Context, item domain.NormalizedURL) error {
 
 	page, exists := s.pages[item.URL]
 	if !exists {
+		if q := s.pageQueues[item.Host]; q != nil && q.Len() >= s.cfg.MaxHostQueueSize {
+			return nil
+		}
 		page = &domain.FrontierItem{
 			URL:          item.URL,
 			Host:         item.Host,
@@ -262,7 +270,7 @@ func (s *Shard) enqueuePageLocked(page *domain.FrontierItem) {
 		priority: page.Priority,
 	})
 
-	if q.Len() == crawlerTrapThreshold {
+	if q.Len() == s.cfg.MaxHostQueueSize {
 		s.logger.Warn("host queue exceeded threshold, potential crawler trap",
 			"host", page.Host,
 			"queue_len", q.Len(),
@@ -305,59 +313,104 @@ func (s *Shard) Lease(ctx context.Context, n int) ([]string, error) {
 		top.inQueue = false
 
 		q := s.pageQueues[top.name]
-		if q.Len() == 0 {
+		var selected *domain.FrontierItem
+
+		// Pop from the host's priority queue, skipping any stale entries
+		// that were retired into deadPages while sitting in the heap.
+		for q != nil && q.Len() > 0 {
+			page := heap.Pop(q).(*QueuedPage)
+			item, ok := s.pages[page.URL]
+			if !ok || item == nil || item.State != domain.StateQueued {
+				continue
+			}
+			selected = item
+			break
+		}
+
+		if selected == nil {
 			continue
 		}
 
-		page := heap.Pop(q).(*QueuedPage)
-		item := s.pages[page.URL]
-		item.State = domain.StateInFlight
-		item.LastFetchAt = now
-		s.inflightPages[page.URL] = struct{}{}
+		selected.State = domain.StateInFlight
+		selected.LastFetchAt = now
+		s.inflightPages[selected.URL] = struct{}{}
 
 		top.inFlight = true
 		top.lastReq = now
 
-		out = append(out, page.URL)
+		out = append(out, selected.URL)
 	}
 	return out, nil
 }
 
-// Ack marks an in-flight URL as successfully processed and schedules its next refresh.
+// Ack marks an in-flight URL as successfully processed without content deduplication
 func (s *Shard) Ack(ctx context.Context, url string) error {
-	return s.AckWithHash(ctx, url, 0)
+	_, err := s.AckWithHash(ctx, url, 0)
+	return err
 }
 
-// AckWithHash marks an in-flight URL as successfully processed, updates content change
-// metrics based on contentHash, and schedules the next refresh interval.
-func (s *Shard) AckWithHash(ctx context.Context, url string, contentHash uint64) error {
+// AckWithHash marks an in-flight URL as successfully processed, performs the Content-Seen
+// duplicate test, and tracks content changes across recrawls.
+// Returns true if the document is new or its content has changed.
+func (s *Shard) AckWithHash(ctx context.Context, url string, contentHash uint64) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	if _, ok := s.inflightPages[url]; !ok {
-		return domain.ErrPageProcessingTimeoutExceeded
+		return false, domain.ErrPageProcessingTimeoutExceeded
 	}
 	delete(s.inflightPages, url)
 
-	now := time.Now()
 	page := s.pages[url]
+	host := page.Host
+
+	if contentHash != 0 {
+		// 1. Content-Seen Test: check if another URL already owns this exact content fingerprint.
+		if owner, exists := s.contentOwners[contentHash]; exists && owner != url {
+			s.retirePageLocked(url)
+			s.releaseHostLocked(host)
+			s.logger.DebugContext(ctx, "duplicate content detected, retiring alias URL",
+				"url", url,
+				"canonical_owner", owner,
+			)
+			return false, nil
+		}
+	}
+
+	now := time.Now()
+	prevFetchCount := page.FetchCount
+	prevHash := page.ContentHash
+
 	page.LastFetchAt = now
 	page.FetchCount++
 	page.FailCount = 0
 	page.State = domain.StateDone
 
+	shouldProcess := true
 	if contentHash != 0 {
-		if page.ContentHash != 0 && page.ContentHash != contentHash {
+		if prevFetchCount == 0 || prevHash == 0 {
+			// First successful fetch of this URL.
+			page.ContentHash = contentHash
+			s.contentOwners[contentHash] = url
+		} else if prevHash != contentHash {
+			// Page content changed since last crawl.
+			if owner, exists := s.contentOwners[prevHash]; exists && owner == url {
+				delete(s.contentOwners, prevHash)
+			}
+			page.ContentHash = contentHash
 			page.ChangeCount++
+			s.contentOwners[contentHash] = url
+		} else {
+			// Page was recrawled and content is identical to the previous snapshot.
+			shouldProcess = false
 		}
-		page.ContentHash = contentHash
 	}
 
 	page.NextFetchAt = now.Add(s.nextInterval(page))
 	s.scheduledPages[url] = struct{}{}
 
-	s.releaseHostLocked(page.Host)
-	return nil
+	s.releaseHostLocked(host)
+	return shouldProcess, nil
 }
 
 // Nack marks an in-flight URL as failed. If FailCount has not exceeded MaxFailCount,
@@ -400,7 +453,7 @@ func (s *Shard) MarkDead(ctx context.Context, url string) error {
 	defer s.mu.Unlock()
 
 	var host string
-	if page, ok := s.pages[url]; ok {
+	if page, ok := s.pages[url]; ok && page != nil {
 		host = page.Host
 	} else {
 		host = hostOf(url)
@@ -415,6 +468,7 @@ func (s *Shard) MarkDead(ctx context.Context, url string) error {
 	s.logger.DebugContext(ctx, "page marked dead and retired", "url", url, "host", host)
 	return nil
 }
+
 
 func (s *Shard) releaseHostLocked(host string) {
 	hs, ok := s.hosts[host]

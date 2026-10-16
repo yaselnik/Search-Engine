@@ -14,6 +14,7 @@ type Config struct {
 	LeaseTimeout        time.Duration `yaml:"lease_timeout" env:"FRONTIER_LEASE_TIMEOUT"`
 	DefaultCrawlDelay   time.Duration `yaml:"default_crawl_delay" env:"FRONTIER_DEFAULT_CRAWL_DELAY"`
 	MaxFailCount        int           `yaml:"max_fail_count" env:"FRONTIER_MAX_FAIL_COUNT"`
+	MaxHostQueueSize    int           `yaml:"max_host_queue_size" env:"MAX_HOST_QUEUE_SIZE"`
 	BaseRefreshInterval time.Duration `yaml:"base_refresh_interval" env:"FRONTIER_BASE_REFRESH_INTERVAL"`
 	MinRefreshInterval  time.Duration `yaml:"min_refresh_interval" env:"FRONTIER_MIN_REFRESH_INTERVAL"`
 	MaxRefreshInterval  time.Duration `yaml:"max_refresh_interval" env:"FRONTIER_MAX_REFRESH_INTERVAL"`
@@ -46,10 +47,11 @@ func DefaultConfig() Config {
 		LeaseTimeout:        2 * time.Minute,
 		DefaultCrawlDelay:   1 * time.Second,
 		MaxFailCount:        5,
+		MaxHostQueueSize:    2000,
 		BaseRefreshInterval: 24 * time.Hour,
 		MinRefreshInterval:  1 * time.Hour,
 		MaxRefreshInterval:  7 * 24 * time.Hour,
-		RobotsUserAgent:     "SearchEngineBot/0.1",
+		RobotsUserAgent:     "Polzun/1.0",
 		RobotsTimeout:       5 * time.Second,
 		RobotsCacheCapacity: 1 << 14,
 		RobotsCacheTTL:      24 * time.Hour,
@@ -73,6 +75,9 @@ func (c Config) withDefaults() Config {
 	}
 	if c.MaxFailCount <= 0 {
 		c.MaxFailCount = def.MaxFailCount
+	}
+	if c.MaxHostQueueSize <= 0 {
+		c.MaxHostQueueSize = def.MaxHostQueueSize
 	}
 	if c.BaseRefreshInterval <= 0 {
 		c.BaseRefreshInterval = def.BaseRefreshInterval

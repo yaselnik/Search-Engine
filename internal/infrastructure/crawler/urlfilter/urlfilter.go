@@ -138,6 +138,11 @@ func (f *Filter) normalizeParsed(u *url.URL) (domain.NormalizedURL, bool) {
 	if host == "" {
 		return domain.NormalizedURL{}, false
 	}
+
+	if isLocalOrPrivateHost(host) {
+		return domain.NormalizedURL{}, false
+	}
+
 	port := u.Port()
 	if (scheme == "http" && port == "80") || (scheme == "https" && port == "443") {
 		port = ""
@@ -185,4 +190,25 @@ func (f *Filter) normalizeParsed(u *url.URL) (domain.NormalizedURL, bool) {
 		URL:  finalURL,
 		Host: u.Host,
 	}, true
+}
+
+// isLocalOrPrivateHost rejects localhost, loopback, link-local, and private network hosts
+// to prevent SSRF and stop the crawler from crawling its own local HTTP server.
+func isLocalOrPrivateHost(host string) bool {
+	if host == "localhost" ||
+		strings.HasSuffix(host, ".localhost") ||
+		strings.HasSuffix(host, ".local") ||
+		strings.HasSuffix(host, ".internal") {
+		return true
+	}
+
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.IsLoopback() ||
+			ip.IsPrivate() ||
+			ip.IsLinkLocalUnicast() ||
+			ip.IsLinkLocalMulticast() ||
+			ip.IsUnspecified()
+	}
+
+	return false
 }
