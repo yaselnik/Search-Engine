@@ -10,7 +10,8 @@ var (
 	ErrInvalidDocument  = errors.New("invalid document")
 )
 
-// Crawler Frontier errors
+// Crawler errors
 var (
-	ErrPageProcessingTimeoutExceeded = errors.New("Page processing timeout exceeded")
+	ErrPageProcessingTimeoutExceeded = errors.New("page processing timeout exceeded")
+	ErrPermanentFetchFailure         = errors.New("permanent fetch failure")
 )
