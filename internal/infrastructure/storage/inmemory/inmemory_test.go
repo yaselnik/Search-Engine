@@ -1,4 +1,4 @@
-package storage
+package inmemoryStorage
 
 import (
 	"context"

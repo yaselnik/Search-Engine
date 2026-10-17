@@ -5,17 +5,24 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"strings"
+	"sync"
 
 	"github.com/yaselnik/Search-Engine/internal/domain"
 )
 
-// Indexer orchestrates the process of fetching documents from storage,
-// tokenizing their content, and adding them to the index.
+const defaultBatchSize = 500
+
+// Indexer orchestrates fetching unindexed documents from storage,
+// tokenizing their title and content, and updating the inverted index.
 type Indexer struct {
-	storage  domain.DocumentStorage
-	index    domain.Index
-	analyzer domain.Analyzer
-	logger   *slog.Logger
+	storage   domain.DocumentStorage
+	index     domain.Index
+	analyzer  domain.Analyzer
+	logger    *slog.Logger
+	batchSize int
+
+	mu sync.Mutex
 }
 
 func NewIndexer(
@@ -29,45 +36,94 @@ func NewIndexer(
 	}
 
 	return &Indexer{
-		storage:  storage,
-		index:    index,
-		analyzer: analyzer,
-		logger:   logger.With("component", "indexer"),
+		storage:   storage,
+		index:     index,
+		analyzer:  analyzer,
+		logger:    logger.With("component", "indexer"),
+		batchSize: defaultBatchSize,
 	}
 }
 
-// Retrieves all documents from the storage and indexes them sequentially.
-// It respects context cancellation and continues processing even if a single document
+// IndexAll re-indexes every document currently stored in DocumentStorage.
 func (i *Indexer) IndexAll(ctx context.Context) error {
 	docs, err := i.storage.GetAll(ctx)
 	if err != nil {
-		return fmt.Errorf("indexer: get all documents from storage: %w", err)
+		return fmt.Errorf("indexer: get all documents: %w", err)
 	}
 
-	i.logger.Info("starting indexing process", "total_documents", len(docs))
+	i.mu.Lock()
+	defer i.mu.Unlock()
 
-	var indexed int
+	indexedIDs := make([]domain.DocID, 0, len(docs))
 	for _, doc := range docs {
-		if ctx.Err() != nil {
-			i.logger.Warn("indexing cancelled via context", "indexed_so_far", indexed)
-			return fmt.Errorf("indexer: context cancelled: %w", ctx.Err())
+		if err := ctx.Err(); err != nil {
+			return err
 		}
-
 		if err := i.IndexDocument(ctx, doc); err != nil {
-			i.logger.Error("failed to index document", "doc_id", doc.ID, "title", doc.Title, "error", err)
+			i.logger.ErrorContext(ctx, "index doc failed", "doc_id", doc.ID, "error", err)
 			continue
 		}
-		indexed++
+		indexedIDs = append(indexedIDs, doc.ID)
 	}
 
-	i.logger.Info("indexing process completed", "indexed", indexed, "total", len(docs))
+	if err := i.storage.MarkIndexed(ctx, indexedIDs); err != nil {
+		return fmt.Errorf("indexer: mark indexed: %w", err)
+	}
 	return nil
 }
 
-// IndexDocument tokenizes a single document's content and adds it to the index.
-func (i *Indexer) IndexDocument(ctx context.Context, doc domain.Document) error {
-	tokens := i.analyzer.Analyze(doc.Content)
+// IndexNew processes all unindexed or recently updated documents in batches.
+func (i *Indexer) IndexNew(ctx context.Context) (int, error) {
+	i.mu.Lock()
+	defer i.mu.Unlock()
 
+	var totalIndexed int
+	for {
+		if err := ctx.Err(); err != nil {
+			return totalIndexed, err
+		}
+
+		docs, err := i.storage.GetUnindexed(ctx, i.batchSize)
+		if err != nil {
+			return totalIndexed, fmt.Errorf("indexer: get unindexed documents: %w", err)
+		}
+		if len(docs) == 0 {
+			break
+		}
+
+		indexedIDs := make([]domain.DocID, 0, len(docs))
+		for _, doc := range docs {
+			if err := ctx.Err(); err != nil {
+				break
+			}
+			if err := i.IndexDocument(ctx, doc); err != nil {
+				i.logger.ErrorContext(ctx, "index doc failed", "doc_id", doc.ID, "error", err)
+				continue
+			}
+			indexedIDs = append(indexedIDs, doc.ID)
+			totalIndexed++
+		}
+
+		if err := i.storage.MarkIndexed(ctx, indexedIDs); err != nil {
+			return totalIndexed, fmt.Errorf("indexer: mark batch indexed: %w", err)
+		}
+
+		if len(docs) < i.batchSize {
+			break
+		}
+	}
+
+	return totalIndexed, nil
+}
+
+// IndexDocument tokenizes a single document's title and content and adds them to the index.
+func (i *Indexer) IndexDocument(_ context.Context, doc domain.Document) error {
+	text := doc.Content
+	if doc.Title != "" && !strings.EqualFold(doc.Title, doc.URL) {
+		text = doc.Title + " " + doc.Content
+	}
+
+	tokens := i.analyzer.Analyze(text)
 	if err := i.index.Add(doc.ID, tokens); err != nil {
 		return fmt.Errorf("indexer: add tokens to index for doc %d: %w", doc.ID, err)
 	}

@@ -18,9 +18,14 @@ func (m *mockStorage) GetAll(ctx context.Context) ([]domain.Document, error) {
 	return m.docs, m.err
 }
 func (m *mockStorage) Add(ctx context.Context, doc domain.Document) error { return nil }
+func (m *mockStorage) Count(ctx context.Context) (int64, error)           { return 0, nil }
 func (m *mockStorage) GetDocumentByID(ctx context.Context, id domain.DocID) (domain.Document, error) {
 	return domain.Document{}, nil
 }
+func (m *mockStorage) GetUnindexed(ctx context.Context, limit int) ([]domain.Document, error) {
+	return []domain.Document{}, nil
+}
+func (m *mockStorage) MarkIndexed(ctx context.Context, ids []domain.DocID) error { return nil }
 func (m *mockStorage) Delete(ctx context.Context, id domain.DocID) error         { return nil }
 func (m *mockStorage) Exists(ctx context.Context, id domain.DocID) (bool, error) { return false, nil }
 

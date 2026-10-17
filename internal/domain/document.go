@@ -6,9 +6,9 @@ type DocID uint64
 
 type Document struct {
 	ID      DocID  `json:"id"`
+	URL     string `json:"source"`
 	Title   string `json:"title"`
 	Content string `json:"content"`
-	URL     string `json:"source"`
 
 	Language string `json:"language"`
 

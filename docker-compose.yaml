@@ -1,0 +1,59 @@
+services:
+  frontier-db:
+    image: postgres:16-alpine
+    container_name: se-frontier-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: frontier_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - frontier_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d frontier_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  storage-db:
+    image: postgres:16-alpine
+    container_name: se-storage-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: storage_db
+    ports:
+      - "5433:5432"
+    volumes:
+      - storage_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d storage_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  index-db:
+    image: postgres:16-alpine
+    container_name: se-index-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: index_db
+    ports:
+      - "5434:5432"
+    volumes:
+      - index_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d index_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  frontier_data:
+  storage_data:
+  index_data:
