@@ -13,6 +13,7 @@ const (
 	StateInFlight
 	StateDone
 	StateFailed
+	StateNotAllowed
 )
 
 type NormalizedURL struct {
