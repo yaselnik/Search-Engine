@@ -5,21 +5,24 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"strings"
 	"sync"
 
 	"github.com/yaselnik/Search-Engine/internal/domain"
 )
 
-// Indexer orchestrates the process of fetching documents from storage,
-// tokenizing their content, and adding them to the index.
-type Indexer struct {
-	storage  domain.DocumentStorage
-	index    domain.Index
-	analyzer domain.Analyzer
-	logger   *slog.Logger
+const defaultBatchSize = 500
 
-	mu      sync.Mutex
-	indexed map[domain.DocID]struct{}
+// Indexer orchestrates fetching unindexed documents from storage,
+// tokenizing their title and content, and updating the inverted index.
+type Indexer struct {
+	storage   domain.DocumentStorage
+	index     domain.Index
+	analyzer  domain.Analyzer
+	logger    *slog.Logger
+	batchSize int
+
+	mu sync.Mutex
 }
 
 func NewIndexer(
@@ -33,64 +36,94 @@ func NewIndexer(
 	}
 
 	return &Indexer{
-		storage:  storage,
-		index:    index,
-		analyzer: analyzer,
-		logger:   logger.With("component", "indexer"),
-		indexed:  make(map[domain.DocID]struct{}),
+		storage:   storage,
+		index:     index,
+		analyzer:  analyzer,
+		logger:    logger.With("component", "indexer"),
+		batchSize: defaultBatchSize,
 	}
 }
 
+// IndexAll re-indexes every document currently stored in DocumentStorage.
 func (i *Indexer) IndexAll(ctx context.Context) error {
-    i.mu.Lock()
-    i.indexed = make(map[domain.DocID]struct{})
-    i.mu.Unlock()
+	docs, err := i.storage.GetAll(ctx)
+	if err != nil {
+		return fmt.Errorf("indexer: get all documents: %w", err)
+	}
 
-    _, err := i.indexPending(ctx, true)
-	return err
+	i.mu.Lock()
+	defer i.mu.Unlock()
+
+	indexedIDs := make([]domain.DocID, 0, len(docs))
+	for _, doc := range docs {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := i.IndexDocument(ctx, doc); err != nil {
+			i.logger.ErrorContext(ctx, "index doc failed", "doc_id", doc.ID, "error", err)
+			continue
+		}
+		indexedIDs = append(indexedIDs, doc.ID)
+	}
+
+	if err := i.storage.MarkIndexed(ctx, indexedIDs); err != nil {
+		return fmt.Errorf("indexer: mark indexed: %w", err)
+	}
+	return nil
 }
 
+// IndexNew processes all unindexed or recently updated documents in batches.
 func (i *Indexer) IndexNew(ctx context.Context) (int, error) {
-    return i.indexPending(ctx, false)
+	i.mu.Lock()
+	defer i.mu.Unlock()
+
+	var totalIndexed int
+	for {
+		if err := ctx.Err(); err != nil {
+			return totalIndexed, err
+		}
+
+		docs, err := i.storage.GetUnindexed(ctx, i.batchSize)
+		if err != nil {
+			return totalIndexed, fmt.Errorf("indexer: get unindexed documents: %w", err)
+		}
+		if len(docs) == 0 {
+			break
+		}
+
+		indexedIDs := make([]domain.DocID, 0, len(docs))
+		for _, doc := range docs {
+			if err := ctx.Err(); err != nil {
+				break
+			}
+			if err := i.IndexDocument(ctx, doc); err != nil {
+				i.logger.ErrorContext(ctx, "index doc failed", "doc_id", doc.ID, "error", err)
+				continue
+			}
+			indexedIDs = append(indexedIDs, doc.ID)
+			totalIndexed++
+		}
+
+		if err := i.storage.MarkIndexed(ctx, indexedIDs); err != nil {
+			return totalIndexed, fmt.Errorf("indexer: mark batch indexed: %w", err)
+		}
+
+		if len(docs) < i.batchSize {
+			break
+		}
+	}
+
+	return totalIndexed, nil
 }
 
-func (i *Indexer) indexPending(ctx context.Context, full bool) (int, error) {
-    docs, err := i.storage.GetAll(ctx)
-    if err != nil {
-        return 0, fmt.Errorf("indexer: get all documents: %w", err)
-    }
+// IndexDocument tokenizes a single document's title and content and adds them to the index.
+func (i *Indexer) IndexDocument(_ context.Context, doc domain.Document) error {
+	text := doc.Content
+	if doc.Title != "" && !strings.EqualFold(doc.Title, doc.URL) {
+		text = doc.Title + " " + doc.Content
+	}
 
-    i.mu.Lock()
-    defer i.mu.Unlock()
-
-    var indexed int
-    for _, doc := range docs {
-        if ctx.Err() != nil {
-            return indexed, ctx.Err()
-        }
-
-        if !full {
-            if _, ok := i.indexed[doc.ID]; ok {
-                continue
-            }
-        }
-
-        if err := i.IndexDocument(ctx, doc); err != nil {
-            i.logger.Error("index doc failed", "doc_id", doc.ID, "error", err)
-            continue
-        }
-
-        i.indexed[doc.ID] = struct{}{}
-        indexed++
-    }
-
-    return indexed, nil
-}
-
-// IndexDocument tokenizes a single document's content and adds it to the index.
-func (i *Indexer) IndexDocument(ctx context.Context, doc domain.Document) error {
-	tokens := i.analyzer.Analyze(doc.Content)
-
+	tokens := i.analyzer.Analyze(text)
 	if err := i.index.Add(doc.ID, tokens); err != nil {
 		return fmt.Errorf("indexer: add tokens to index for doc %d: %w", doc.ID, err)
 	}

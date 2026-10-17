@@ -21,9 +21,11 @@ import (
 	"github.com/yaselnik/Search-Engine/internal/infrastructure/crawler/frontier"
 	parserHTML "github.com/yaselnik/Search-Engine/internal/infrastructure/crawler/parser"
 	"github.com/yaselnik/Search-Engine/internal/infrastructure/crawler/urlfilter"
-	"github.com/yaselnik/Search-Engine/internal/infrastructure/index"
+	"github.com/yaselnik/Search-Engine/internal/infrastructure/index/inmemory"
+	pgIndex "github.com/yaselnik/Search-Engine/internal/infrastructure/index/postgres"
 	"github.com/yaselnik/Search-Engine/internal/infrastructure/ranker"
-	"github.com/yaselnik/Search-Engine/internal/infrastructure/storage"
+	memStorage "github.com/yaselnik/Search-Engine/internal/infrastructure/storage/inmemory"
+	pgStorage "github.com/yaselnik/Search-Engine/internal/infrastructure/storage/postgres"
 	"github.com/yaselnik/Search-Engine/internal/usecase/crawler"
 	"github.com/yaselnik/Search-Engine/internal/usecase/indexer"
 	"github.com/yaselnik/Search-Engine/internal/usecase/searcher"
@@ -86,6 +88,10 @@ func main() {
 	logLevel := flag.String("log-level", "info", "log level (debug, info, warn, error)")
 	httpAddr := flag.String("addr", ":8080", "http server address")
 	indexInterval := flag.Duration("index-interval", 2*time.Second, "how often to index new documents")
+	inMemory := flag.Bool("in-memory", false, "use in-memory storage instead of PostgreSQL")
+	frontierDSN := flag.String("frontier-dsn", "postgres://postgres:password@localhost:5432/frontier_db?sslmode=disable", "PostgreSQL DSN for frontier")
+	storageDSN := flag.String("storage-dsn", "postgres://postgres:password@localhost:5433/storage_db?sslmode=disable", "PostgreSQL DSN for document storage")
+	indexDSN := flag.String("index-dsn", "postgres://postgres:password@localhost:5434/index_db?sslmode=disable", "PostgreSQL DSN for inverted index")
 	flag.Parse()
 
 	var level slog.Level
@@ -97,25 +103,58 @@ func main() {
 		Level: level,
 	}))
 	slog.SetDefault(logger)
-	// Suppress internal net/http HTTP/2 frame diagnostic logs written to the standard log package.
 	log.SetOutput(io.Discard)
 
-	logger.Info("starting search engine", "log_level", level.String())
+	logger.Info("starting search engine", "log_level", level.String(), "in_memory", *inMemory)
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	idx := index.NewInMemoryIndex()
-	docStorage := storage.NewInMemoryStorage()
+	var (
+		idx          domain.Index
+		docStorage   domain.DocumentStorage
+		frontierOpts []frontier.Option
+	)
+
+	if *inMemory {
+		idx = inmemoryIndex.NewInMemoryIndex()
+		docStorage = memStorage.NewInMemoryStorage()
+	} else {
+		fStore, err := frontier.NewPostgresStore(ctx, *frontierDSN)
+		if err != nil {
+			logger.Error("failed to init frontier postgres store", "error", err)
+			return
+		}
+		defer fStore.Close()
+		frontierOpts = append(frontierOpts, frontier.WithPostgresStore(fStore))
+
+		pStorage, err := pgStorage.NewPostgresStorage(ctx, *storageDSN)
+		if err != nil {
+			logger.Error("failed to init document postgres storage", "error", err)
+			return
+		}
+		defer pStorage.Close()
+		docStorage = pStorage
+
+		pIdx, err := pgIndex.NewPostgresIndex(ctx, *indexDSN)
+		if err != nil {
+			logger.Error("failed to init postgres inverted index", "error", err)
+			return
+		}
+		defer pIdx.Close()
+		idx = pIdx
+
+		logger.Info("connected to PostgreSQL databases (frontier_db, storage_db, index_db)")
+	}
 
 	engStemmer := stemmer.NewEngStemmer()
-	stemmer := stemmer.NewMultiLanguageStemmer(engStemmer, stemmer.NoopStemmer{})
-	analyzer := analyzer.NewAnalyzer(analyzer.RegexpTokenize, analyzer.LowercaseFilter{}, stemmer)
+	multiStemmer := stemmer.NewMultiLanguageStemmer(engStemmer, stemmer.NoopStemmer{})
+	textAnalyzer := analyzer.NewAnalyzer(analyzer.RegexpTokenize, analyzer.LowercaseFilter{}, multiStemmer)
 
 	urlFilter := urlfilter.NewFilter()
-	crFetcher := fetcher.NewFetcher(nil, "Polzun/1.0")
+	crFetcher := fetcher.NewFetcher(nil, "SearchEngineBot/0.1")
 	crParser := parserHTML.NewParser()
-	crFrontier := frontier.NewFrontier(ctx, 0, logger)
+	crFrontier := frontier.NewFrontier(ctx, 0, logger, frontierOpts...)
 	defer crFrontier.Close()
 
 	normalizedSeeds := make([]domain.NormalizedURL, 0, len(SeedURLs))
@@ -136,29 +175,24 @@ func main() {
 		crawler.Config{
 			FetcherWorkers: 20,
 			ParserWorkers:  12,
-			MaxPages:       100000,
+			MaxPages:       0,
 			RawBufferSize:  1000,
 		},
 		logger)
 
-	indexerUC := indexer.NewIndexer(docStorage, idx, analyzer, logger)
-
+	indexerUC := indexer.NewIndexer(docStorage, idx, textAnalyzer, logger)
 	bm25 := ranker.NewBM25()
-	searcher := searcher.NewSearcher(docStorage, idx, analyzer, bm25)
+	searchUC := searcher.NewSearcher(docStorage, idx, textAnalyzer, bm25)
 
-	handler := httpDelivery.NewHandler(searcher, docStorage, logger)
-
+	handler := httpDelivery.NewHandler(searchUC, docStorage, logger)
 	mux := http.NewServeMux()
-
 	mux.HandleFunc("GET /api/search", handler.Search)
 	mux.HandleFunc("GET /api/documents/{id}", handler.GetDocument)
 
 	appHandler := httpDelivery.LoggingMiddleware(logger, mux)
-
 	server := &http.Server{
-		Addr:    *httpAddr,
-		Handler: appHandler,
-
+		Addr:         *httpAddr,
+		Handler:      appHandler,
 		ReadTimeout:  5 * time.Second,
 		WriteTimeout: 10 * time.Second,
 		IdleTimeout:  120 * time.Second,
@@ -166,7 +200,6 @@ func main() {
 
 	go func() {
 		logger.Info("background indexer started", "interval", indexInterval.String())
-
 		ticker := time.NewTicker(*indexInterval)
 		defer ticker.Stop()
 
@@ -176,13 +209,8 @@ func main() {
 				logger.Info("background indexer stopped")
 				return
 			case <-ticker.C:
-				_, err := indexerUC.IndexNew(ctx)
-				if err != nil {
-					if errors.Is(err, context.Canceled) {
-						return
-					}
+				if _, err := indexerUC.IndexNew(ctx); err != nil && !errors.Is(err, context.Canceled) {
 					logger.Warn("indexer tick failed", "error", err)
-					continue
 				}
 			}
 		}
@@ -201,13 +229,10 @@ func main() {
 	if err != nil && !errors.Is(err, context.Canceled) {
 		logger.Error("crawler failed", "error", err)
 	}
-
 	logger.Info("crawler finished", "loaded", loaded)
 
-	if n, err := indexerUC.IndexNew(ctx); err != nil {
-		if !errors.Is(err, context.Canceled) {
-			logger.Warn("final index pass failed", "error", err)
-		}
+	if n, err := indexerUC.IndexNew(ctx); err != nil && !errors.Is(err, context.Canceled) {
+		logger.Warn("final index pass failed", "error", err)
 	} else if n > 0 {
 		logger.Info("final index pass", "count", n)
 	}
@@ -222,6 +247,5 @@ func main() {
 	if err := server.Shutdown(shutdownCtx); err != nil {
 		logger.Error("http server shutdown failed", "error", err)
 	}
-
 	logger.Info("search engine stopped")
 }

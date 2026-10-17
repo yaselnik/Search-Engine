@@ -20,15 +20,19 @@ const (
 	newPageBaseUrgency = 5.0
 	waitingAgeFactor   = 0.1
 	depthSlashPenalty  = 0.15
+
+	dbFlushTimeout    = 20 * time.Second
+	dbRefillBatchSize = 250
 )
 
 // Shard represents an isolated partition of the Frontier state.
 // It manages per-host politeness timers, page priority queues, and a background
 // reaper goroutine that recovers stalled in-flight requests and schedules due refreshes.
 type Shard struct {
-	mu  sync.Mutex
-	id  int
-	cfg Config
+	mu    sync.Mutex
+	id    int
+	cfg   Config
+	store *PostgresStore
 
 	pages      map[string]*domain.FrontierItem
 	hosts      map[string]*HostState
@@ -38,7 +42,14 @@ type Shard struct {
 	inflightPages  map[string]struct{} // Pages currently leased to workers
 	scheduledPages map[string]struct{} // Pages in StateDone/StateFailed waiting for NextFetchAt
 	deadPages      map[uint64]struct{} // Compact 8-byte tombstones for retired/disallowed URLs
+	knownNextFetch map[uint64]int64    // 16-byte markers for pages evicted to PostgreSQL (fp -> nextFetchUnix)
 	contentOwners  map[uint64]string   // Maps 64-bit content hash -> canonical owner URL (Content-Seen test)
+
+	// Write-behind dirty buffers for PostgreSQL batch flushing
+	dirtyHosts map[string]struct{}
+	dirtyPages map[string]struct{}
+	dirtyDead  map[int64]deadRecord
+	rankDeltas map[int64]int
 
 	robots *RobotsCache
 	logger *slog.Logger
@@ -50,11 +61,17 @@ type Shard struct {
 
 // NewShard creates and starts a Shard with default configuration.
 func NewShard(parentCtx context.Context, logger *slog.Logger) *Shard {
-	return NewShardWithConfig(parentCtx, 0, DefaultConfig(), nil, logger)
+	return NewShardWithConfig(parentCtx, 0, DefaultConfig(), nil, nil, logger)
 }
 
 // NewShardWithConfig creates and starts a Shard with custom configuration.
-func NewShardWithConfig(parentCtx context.Context, id int, cfg Config, httpClient *http.Client, logger *slog.Logger) *Shard {
+func NewShardWithConfig(parentCtx context.Context,
+	id int,
+	cfg Config,
+	httpClient *http.Client,
+	store *PostgresStore,
+	logger *slog.Logger,
+) *Shard {
 	cfg = cfg.withDefaults()
 	if logger == nil {
 		logger = slog.Default()
@@ -63,21 +80,76 @@ func NewShardWithConfig(parentCtx context.Context, id int, cfg Config, httpClien
 	s := &Shard{
 		id:             id,
 		cfg:            cfg,
+		store:          store,
 		pages:          make(map[string]*domain.FrontierItem),
 		hosts:          make(map[string]*HostState),
 		pageQueues:     make(map[string]*PageQueue),
 		inflightPages:  make(map[string]struct{}),
 		scheduledPages: make(map[string]struct{}),
 		deadPages:      make(map[uint64]struct{}),
-		contentOwners: make(map[uint64]string),
+		knownNextFetch: make(map[uint64]int64),
+		contentOwners:  make(map[uint64]string),
+		dirtyHosts:     make(map[string]struct{}),
+		dirtyPages:     make(map[string]struct{}),
+		dirtyDead:      make(map[int64]deadRecord),
+		rankDeltas:     make(map[int64]int),
 		robots:         NewRobotsCacheWithConfig(cfg, httpClient, logger),
 		logger:         logger.With("component", "shard", "shard_id", id),
 		ctx:            ctx,
 		cancel:         cancel,
 	}
+
+	if s.store != nil {
+		s.restoreFromStore(parentCtx)
+	}
+
 	s.wg.Add(1)
 	go s.reaper()
 	return s
+}
+
+func (s *Shard) restoreFromStore(ctx context.Context) {
+	loadCtx, cancel := context.WithTimeout(ctx, dbFlushTimeout)
+	defer cancel()
+
+	snap, err := s.store.LoadShardState(loadCtx, s.id, s.cfg.MaxHostQueueSize)
+	if err != nil {
+		s.logger.Error("failed to restore shard state from postgres", "error", err)
+		return
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.deadPages = snap.deadKeys
+	s.knownNextFetch = snap.knownNextFetch
+	s.contentOwners = snap.contentOwners
+
+	for _, hs := range snap.hosts {
+		s.hosts[hs.name] = hs
+		q := &PageQueue{}
+		heap.Init(q)
+		s.pageQueues[hs.name] = q
+	}
+
+	for _, page := range snap.queuedPages {
+		if _, ok := s.hosts[page.Host]; !ok {
+			hs := &HostState{
+				name:       page.Host,
+				crawlDelay: s.cfg.DefaultCrawlDelay,
+				readyAt:    time.Now(),
+			}
+			s.hosts[page.Host] = hs
+			q := &PageQueue{}
+			heap.Init(q)
+			s.pageQueues[page.Host] = q
+		}
+		s.pages[page.URL] = page
+		s.enqueuePageLocked(page)
+	}
+
+	clear(s.dirtyPages)
+	clear(s.dirtyHosts)
 }
 
 // Close stops the background reaper goroutine and waits for it to exit.
@@ -88,6 +160,7 @@ func (s *Shard) Close() {
 	s.logger.Debug("shard closed",
 		"total_hosts", len(s.hosts),
 		"active_pages", len(s.pages),
+		"evicted_pages", len(s.knownNextFetch),
 		"dead_pages", len(s.deadPages),
 	)
 	s.mu.Unlock()
@@ -96,7 +169,7 @@ func (s *Shard) Close() {
 func (s *Shard) stats() (hosts, activePages, deadPages int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return len(s.hosts), len(s.pages), len(s.deadPages)
+	return len(s.hosts), len(s.pages) + len(s.knownNextFetch), len(s.deadPages)
 }
 
 func urlFingerprint(rawURL string) uint64 {
@@ -106,16 +179,37 @@ func urlFingerprint(rawURL string) uint64 {
 }
 
 // retirePageLocked removes the full FrontierItem from memory and stores an 8-byte tombstone.
-func (s *Shard) retirePageLocked(rawURL string) {
-	if page, ok := s.pages[rawURL]; ok && page.ContentHash != 0 {
-		if owner, exists := s.contentOwners[page.ContentHash]; exists && owner == rawURL {
-			delete(s.contentOwners, page.ContentHash)
+func (s *Shard) retirePageLocked(rawURL, host string) {
+	if page, ok := s.pages[rawURL]; ok {
+		if host == "" {
+			host = page.Host
+		}
+		if page.ContentHash != 0 {
+			if owner, exists := s.contentOwners[page.ContentHash]; exists && owner == rawURL {
+				delete(s.contentOwners, page.ContentHash)
+			}
 		}
 	}
+	if host == "" {
+		host = hostOf(rawURL)
+	}
+
+	fp := urlFingerprint(rawURL)
 	delete(s.inflightPages, rawURL)
 	delete(s.scheduledPages, rawURL)
 	delete(s.pages, rawURL)
-	s.deadPages[urlFingerprint(rawURL)] = struct{}{}
+	delete(s.dirtyPages, rawURL)
+	delete(s.knownNextFetch, fp)
+	s.deadPages[fp] = struct{}{}
+
+	if s.store != nil && host != "" {
+		key := compositeURLKey(host, rawURL)
+		s.dirtyDead[key] = deadRecord{
+			urlKey: key,
+			url:    rawURL,
+			host:   host,
+		}
+	}
 }
 
 func (s *Shard) isDead(rawURL string) bool {
@@ -138,6 +232,9 @@ func (s *Shard) reaper() {
 			return
 		case <-t.C:
 			s.requeue()
+			if s.store != nil {
+				s.flushAndRefill()
+			}
 		}
 	}
 }
@@ -169,7 +266,7 @@ func (s *Shard) requeue() {
 				"next_fetch_at", page.NextFetchAt,
 			)
 		} else {
-			s.retirePageLocked(url)
+			s.retirePageLocked(url, host)
 			s.logger.Warn("page retired after max lease timeouts",
 				"url", url,
 				"fail_count", page.FailCount,
@@ -180,12 +277,107 @@ func (s *Shard) requeue() {
 
 	// 2. Enqueue pages whose scheduled refresh or retry time (NextFetchAt) has arrived.
 	for url := range s.scheduledPages {
-		page := s.pages[url]
+		page, ok := s.pages[url]
+		if !ok {
+			delete(s.scheduledPages, url)
+			continue
+		}
 		if now.Before(page.NextFetchAt) {
 			continue
 		}
 		delete(s.scheduledPages, url)
 		s.enqueuePageLocked(page)
+	}
+}
+
+func (s *Shard) flushAndRefill() {
+	s.mu.Lock()
+	hosts := make([]*HostState, 0, len(s.dirtyHosts))
+	for h := range s.dirtyHosts {
+		if hs, ok := s.hosts[h]; ok {
+			hsCopy := *hs
+			hosts = append(hosts, &hsCopy)
+		}
+	}
+	clear(s.dirtyHosts)
+
+	pages := make([]*domain.FrontierItem, 0, len(s.dirtyPages))
+	for u := range s.dirtyPages {
+		if p, ok := s.pages[u]; ok {
+			pCopy := *p
+			pages = append(pages, &pCopy)
+		}
+	}
+	clear(s.dirtyPages)
+
+	dead := make([]deadRecord, 0, len(s.dirtyDead))
+	for _, d := range s.dirtyDead {
+		dead = append(dead, d)
+	}
+	clear(s.dirtyDead)
+
+	deltas := make(map[int64]int, len(s.rankDeltas))
+	for k, v := range s.rankDeltas {
+		deltas[k] = v
+	}
+	clear(s.rankDeltas)
+
+	// Evict completed/failed pages waiting for future NextFetchAt from RAM once queued for flush.
+	now := time.Now()
+	for u := range s.scheduledPages {
+		if p, ok := s.pages[u]; ok && now.Before(p.NextFetchAt) {
+			s.knownNextFetch[urlFingerprint(u)] = p.NextFetchAt.Unix()
+			delete(s.scheduledPages, u)
+			delete(s.pages, u)
+		}
+	}
+	s.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), dbFlushTimeout)
+	defer cancel()
+
+	if err := s.store.FlushShard(ctx, s.id, hosts, pages, dead, deltas); err != nil {
+		s.logger.Error("failed to flush shard state to postgres", "error", err)
+		return
+	}
+
+	// Read-ahead refill: bring due pages from PostgreSQL back into the shard's active queue.
+	duePages, err := s.store.FetchDuePages(ctx, s.id, time.Now(), dbRefillBatchSize)
+	if err != nil {
+		s.logger.Error("failed to fetch due pages from postgres", "error", err)
+		return
+	}
+	if len(duePages) == 0 {
+		return
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, item := range duePages {
+		fp := urlFingerprint(item.URL)
+		if _, isDead := s.deadPages[fp]; isDead {
+			continue
+		}
+		if _, inRAM := s.pages[item.URL]; inRAM {
+			continue
+		}
+		if q := s.pageQueues[item.Host]; q != nil && q.Len() >= s.cfg.MaxHostQueueSize {
+			continue
+		}
+		if _, ok := s.hosts[item.Host]; !ok {
+			hs := &HostState{
+				name:       item.Host,
+				crawlDelay: s.cfg.DefaultCrawlDelay,
+				readyAt:    time.Now(),
+			}
+			s.hosts[item.Host] = hs
+			q := &PageQueue{}
+			heap.Init(q)
+			s.pageQueues[item.Host] = q
+		}
+		delete(s.knownNextFetch, fp)
+		s.pages[item.URL] = item
+		s.enqueuePageLocked(item)
 	}
 }
 
@@ -207,7 +399,7 @@ func (s *Shard) Push(ctx context.Context, item domain.NormalizedURL) error {
 	}
 
 	if !allowed {
-		s.retirePageLocked(item.URL)
+		s.retirePageLocked(item.URL, item.Host)
 		s.logger.DebugContext(ctx, "url disallowed by robots.txt", "url", item.URL, "host", item.Host)
 		return nil
 	}
@@ -225,8 +417,19 @@ func (s *Shard) Push(ctx context.Context, item domain.NormalizedURL) error {
 		q := &PageQueue{}
 		heap.Init(q)
 		s.pageQueues[item.Host] = q
-	} else if delay > 0 {
+		s.dirtyHosts[item.Host] = struct{}{}
+	} else if delay > 0 && hs.crawlDelay != delay {
 		hs.crawlDelay = delay
+		s.dirtyHosts[item.Host] = struct{}{}
+	}
+
+	// If the page was already crawled and evicted to PostgreSQL until its NextFetchAt,
+	// record the PageRank increment without allocating a FrontierItem in RAM.
+	if nextUnix, evicted := s.knownNextFetch[fp]; evicted && now.Unix() < nextUnix {
+		if s.store != nil {
+			s.rankDeltas[compositeURLKey(item.Host, item.URL)]++
+		}
+		return nil
 	}
 
 	page, exists := s.pages[item.URL]
@@ -244,6 +447,7 @@ func (s *Shard) Push(ctx context.Context, item domain.NormalizedURL) error {
 		s.pages[item.URL] = page
 	} else {
 		page.PageRank++
+		s.dirtyPages[item.URL] = struct{}{}
 	}
 
 	switch page.State {
@@ -270,16 +474,19 @@ func (s *Shard) enqueuePageLocked(page *domain.FrontierItem) {
 		priority: page.Priority,
 	})
 
-	if q.Len() == s.cfg.MaxHostQueueSize {
+	page.State = domain.StateQueued
+	page.NextFetchAt = now
+	s.dirtyPages[page.URL] = struct{}{}
+
+	hs := s.hosts[page.Host]
+	if q.Len() == s.cfg.MaxHostQueueSize && !hs.trapWarned {
+		hs.trapWarned = true
 		s.logger.Warn("host queue exceeded threshold, potential crawler trap",
 			"host", page.Host,
 			"queue_len", q.Len(),
 		)
 	}
 
-	page.State = domain.StateQueued
-
-	hs := s.hosts[page.Host]
 	// Only place the host in HostsQueue if it is not already queued and has no active in-flight request.
 	if !hs.inQueue && !hs.inFlight {
 		earliestReady := hs.lastReq.Add(hs.crawlDelay)
@@ -290,6 +497,7 @@ func (s *Shard) enqueuePageLocked(page *domain.FrontierItem) {
 		}
 		heap.Push(&s.hostsQueue, hs)
 		hs.inQueue = true
+		s.dirtyHosts[page.Host] = struct{}{}
 	}
 }
 
@@ -334,9 +542,11 @@ func (s *Shard) Lease(ctx context.Context, n int) ([]string, error) {
 		selected.State = domain.StateInFlight
 		selected.LastFetchAt = now
 		s.inflightPages[selected.URL] = struct{}{}
+		s.dirtyPages[selected.URL] = struct{}{}
 
 		top.inFlight = true
 		top.lastReq = now
+		s.dirtyHosts[top.name] = struct{}{}
 
 		out = append(out, selected.URL)
 	}
@@ -367,7 +577,13 @@ func (s *Shard) AckWithHash(ctx context.Context, url string, contentHash uint64)
 	if contentHash != 0 {
 		// 1. Content-Seen Test: check if another URL already owns this exact content fingerprint.
 		if owner, exists := s.contentOwners[contentHash]; exists && owner != url {
-			s.retirePageLocked(url)
+			if ownerPage, ok := s.pages[owner]; ok && ownerPage != nil {
+				ownerPage.PageRank += page.PageRank
+				s.dirtyPages[owner] = struct{}{}
+			} else if s.store != nil {
+				s.rankDeltas[compositeURLKey(hostOf(owner), owner)] += page.PageRank
+			}
+			s.retirePageLocked(url, host)
 			s.releaseHostLocked(host)
 			s.logger.DebugContext(ctx, "duplicate content detected, retiring alias URL",
 				"url", url,
@@ -408,6 +624,7 @@ func (s *Shard) AckWithHash(ctx context.Context, url string, contentHash uint64)
 
 	page.NextFetchAt = now.Add(s.nextInterval(page))
 	s.scheduledPages[url] = struct{}{}
+	s.dirtyPages[url] = struct{}{}
 
 	s.releaseHostLocked(host)
 	return shouldProcess, nil
@@ -416,7 +633,7 @@ func (s *Shard) AckWithHash(ctx context.Context, url string, contentHash uint64)
 // Nack marks an in-flight URL as failed. If FailCount has not exceeded MaxFailCount,
 // the page is scheduled for retry with exponential backoff and jitter; otherwise it is retired.
 func (s *Shard) Nack(ctx context.Context, url string) error {
-s.mu.Lock()
+	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	if _, ok := s.inflightPages[url]; !ok {
@@ -434,8 +651,9 @@ s.mu.Lock()
 	if page.FailCount <= s.cfg.MaxFailCount {
 		page.NextFetchAt = now.Add(backoff(page.FailCount))
 		s.scheduledPages[url] = struct{}{}
+		s.dirtyPages[url] = struct{}{}
 	} else {
-		s.retirePageLocked(url)
+		s.retirePageLocked(url, host)
 		s.logger.WarnContext(ctx, "page retired after exceeding max fail count",
 			"url", url,
 			"fail_count", page.FailCount,
@@ -460,7 +678,7 @@ func (s *Shard) MarkDead(ctx context.Context, url string) error {
 	}
 
 	_, wasInFlight := s.inflightPages[url]
-	s.retirePageLocked(url)
+	s.retirePageLocked(url, host)
 
 	if wasInFlight && host != "" {
 		s.releaseHostLocked(host)
@@ -468,7 +686,6 @@ func (s *Shard) MarkDead(ctx context.Context, url string) error {
 	s.logger.DebugContext(ctx, "page marked dead and retired", "url", url, "host", host)
 	return nil
 }
-
 
 func (s *Shard) releaseHostLocked(host string) {
 	hs, ok := s.hosts[host]
@@ -480,6 +697,7 @@ func (s *Shard) releaseHostLocked(host string) {
 	hs.inFlight = false
 	hs.lastReq = now
 	hs.readyAt = now.Add(hs.crawlDelay)
+	s.dirtyHosts[host] = struct{}{}
 
 	// Re-insert the host into HostsQueue only if it still has queued pages waiting.
 	if !hs.inQueue && s.pageQueues[host].Len() > 0 {

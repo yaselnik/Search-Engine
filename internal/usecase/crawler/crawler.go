@@ -54,9 +54,6 @@ func NewCrawler(
 	if opts.RawBufferSize <= 0 {
 		opts.RawBufferSize = 200
 	}
-	if opts.MaxPages <= 0 {
-		opts.MaxPages = 1000
-	}
 
 	return &Crawler{
 		urlFilter: filter,
@@ -74,20 +71,20 @@ func (c *Crawler) Start(ctx context.Context) (int, error) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	var wg sync.WaitGroup
+	var fetcherWg, parserWg sync.WaitGroup
 
 	for i := 0; i < c.opts.FetcherWorkers; i++ {
-		wg.Add(1)
+		fetcherWg.Add(1)
 		go func(id int) {
-			defer wg.Done()
+			defer fetcherWg.Done()
 			c.runFetcher(ctx, id)
 		}(i)
 	}
 
 	for i := 0; i < c.opts.ParserWorkers; i++ {
-		wg.Add(1)
+		parserWg.Add(1)
 		go func() {
-			defer wg.Done()
+			defer parserWg.Done()
 			c.runParser(ctx)
 		}()
 	}
@@ -100,6 +97,11 @@ func (c *Crawler) Start(ctx context.Context) (int, error) {
 		progressTicks := 0
 		startTime := time.Now()
 
+		initialDocs, err := c.storage.Count(ctx)
+		if err != nil {
+			c.logger.WarnContext(ctx, "failed to get initial document count", "error", err)
+		}
+
 		for {
 			select {
 			case <-ctx.Done():
@@ -108,7 +110,7 @@ func (c *Crawler) Start(ctx context.Context) (int, error) {
 			}
 
 			loaded := c.loaded.Load()
-			if loaded >= int64(c.opts.MaxPages) {
+			if c.opts.MaxPages > 0 && loaded >= int64(c.opts.MaxPages) {
 				c.logger.Info("max pages reached", "loaded", loaded)
 				cancel()
 				return
@@ -122,8 +124,11 @@ func (c *Crawler) Start(ctx context.Context) (int, error) {
 				if elapsed > 0 {
 					rate = float64(loaded) / elapsed
 				}
+				totalDocs := initialDocs + loaded
+
 				c.logger.Info("crawler progress",
-					"loaded", loaded,
+					"session_loaded", loaded,
+					"total_docs", totalDocs,
 					"max_pages", c.opts.MaxPages,
 					"pages_per_sec", int(rate*10)/10,
 					"inflight_fetches", c.inflight.Load(),
@@ -149,12 +154,14 @@ func (c *Crawler) Start(ctx context.Context) (int, error) {
 		}
 	}()
 
-	wg.Wait()
+	fetcherWg.Wait()
+	close(c.rawPages)
+	parserWg.Wait()
 	return int(c.loaded.Load()), nil
 }
 
 func (c *Crawler) shouldStop() bool {
-	return c.loaded.Load() >= int64(c.opts.MaxPages)
+	return c.opts.MaxPages > 0 && c.loaded.Load() >= int64(c.opts.MaxPages)
 }
 
 func (c *Crawler) runFetcher(ctx context.Context, _ int) {
@@ -185,7 +192,7 @@ func (c *Crawler) runFetcher(ctx context.Context, _ int) {
 		}
 
 		URL := URLs[0]
-		
+
 		c.inflight.Add(1)
 		page, err := c.fetcher.Fetch(ctx, URL)
 		if err != nil {
@@ -222,19 +229,13 @@ func (c *Crawler) runFetcher(ctx context.Context, _ int) {
 	}
 }
 
-func (c *Crawler) runParser(ctx context.Context) {
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case page, ok := <-c.rawPages:
-			if !ok {
-				return
-			}
-			c.activeParsers.Add(1)
-			c.parseOne(ctx, page)
-			c.activeParsers.Add(-1)
-		}
+func (c *Crawler) runParser(_ context.Context) {
+	for page := range c.rawPages {
+		c.activeParsers.Add(1)
+		saveCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		c.parseOne(saveCtx, page)
+		cancel()
+		c.activeParsers.Add(-1)
 	}
 }
 

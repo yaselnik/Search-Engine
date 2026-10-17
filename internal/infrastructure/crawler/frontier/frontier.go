@@ -48,10 +48,20 @@ func NewFrontierWithConfig(ctx context.Context, cfg Config, logger *slog.Logger,
 		shards: make([]*Shard, cfg.ShardsCount),
 		logger: logger.With("component", "frontier"),
 	}
+	var restoredHosts, restoredActive, restoredDead int
 	for i := range f.shards {
-		f.shards[i] = NewShardWithConfig(ctx, i, cfg, o.httpClient, logger)
+		f.shards[i] = NewShardWithConfig(ctx, i, cfg, o.httpClient, o.store, logger)
+		h, a, d := f.shards[i].stats()
+		restoredHosts += h
+		restoredActive += a
+		restoredDead += d
 	}
-	f.logger.Info("frontier started", "shards", cfg.ShardsCount)
+	f.logger.Info("frontier started",
+		"shards", cfg.ShardsCount,
+		"restored_hosts", restoredHosts,
+		"restored_active_pages", restoredActive,
+		"restored_dead_pages", restoredDead,
+	)
 	return f
 }
 

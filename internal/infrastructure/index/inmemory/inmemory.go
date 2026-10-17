@@ -1,4 +1,4 @@
-package index
+package inmemoryIndex
 
 import (
 	"slices"
@@ -51,15 +51,16 @@ func (r *InMemoryIndex) Add(docID domain.DocID, tokens []domain.Token) error {
 	r.docTokens[docID] = make(map[string]struct{})
 
 	for _, token := range tokens {
-		if _, exists := tokenStats[token.Value]; !exists {
-			tokenStats[token.Value] = &domain.Posting{
+		posting, exists := tokenStats[token.Value]
+		if !exists {
+			posting = &domain.Posting{
 				DocID:     docID,
 				Frequency: 0,
 				Positions: make([]uint32, 0, 1),
 			}
+			tokenStats[token.Value] = posting
 		}
 
-		posting := tokenStats[token.Value]
 		posting.Frequency++
 		posting.Positions = append(posting.Positions, token.Position)
 		posting.Offsets = append(posting.Offsets, token.Offset)
@@ -74,8 +75,7 @@ func (r *InMemoryIndex) Add(docID domain.DocID, tokens []domain.Token) error {
 	return nil
 }
 
-// Retrieves the list of postings for a normalized term.
-// Returns nil if the value is not found in the index.
+// GetPostings returns a safe copy of the postings list for a normalized term.
 func (r *InMemoryIndex) GetPostings(term string) ([]domain.Posting, error) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -85,11 +85,10 @@ func (r *InMemoryIndex) GetPostings(term string) ([]domain.Posting, error) {
 		return nil, nil
 	}
 
-	return post, nil
+	return slices.Clone(post), nil
 }
 
-// Deletes all occurrences of a document from the index.
-// It is a no-op if the document does not exist.
+// Remove deletes all occurrences of a document from the index and updates corpus stats.
 func (r *InMemoryIndex) Remove(id domain.DocID) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -97,8 +96,6 @@ func (r *InMemoryIndex) Remove(id domain.DocID) error {
 	return r.removeUnsafe(id)
 }
 
-// Performs the actual removal logic.
-// It MUST be called only when the write lock (mu) is already held.
 func (r *InMemoryIndex) removeUnsafe(id domain.DocID) error {
 	tokens, exists := r.docTokens[id]
 	if !exists {
@@ -121,6 +118,18 @@ func (r *InMemoryIndex) removeUnsafe(id domain.DocID) error {
 
 	delete(r.docTokens, id)
 
+	if oldLen, ok := r.docLengths[id]; ok {
+		if r.totalLength >= uint64(oldLen) {
+			r.totalLength -= uint64(oldLen)
+		} else {
+			r.totalLength = 0
+		}
+		delete(r.docLengths, id)
+	}
+	if r.docCount > 0 {
+		r.docCount--
+	}
+
 	return nil
 }
 
@@ -142,7 +151,7 @@ func (r *InMemoryIndex) GetAvgDocLength() float64 {
 	return float64(r.totalLength) / float64(r.docCount)
 }
 
-// Returns document length in tokens
+// GetDocLength returns document length in tokens
 func (r *InMemoryIndex) GetDocLength(docID domain.DocID) float64 {
 	r.mu.RLock()
 	defer r.mu.RUnlock()

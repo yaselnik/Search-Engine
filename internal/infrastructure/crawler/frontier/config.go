@@ -30,6 +30,14 @@ type Option func(*options)
 
 type options struct {
 	httpClient *http.Client
+	store      *PostgresStore
+}
+
+// WithPostgresStore attaches a persistent PostgreSQL store to the Frontier.
+func WithPostgresStore(store *PostgresStore) Option {
+	return func(o *options) {
+		o.store = store
+	}
 }
 
 // WithRobotsHTTPClient sets a custom *http.Client for fetching robots.txt.
@@ -47,7 +55,7 @@ func DefaultConfig() Config {
 		LeaseTimeout:        2 * time.Minute,
 		DefaultCrawlDelay:   1 * time.Second,
 		MaxFailCount:        5,
-		MaxHostQueueSize:    2000,
+		MaxHostQueueSize:    1000,
 		BaseRefreshInterval: 24 * time.Hour,
 		MinRefreshInterval:  1 * time.Hour,
 		MaxRefreshInterval:  7 * 24 * time.Hour,

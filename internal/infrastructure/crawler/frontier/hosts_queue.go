@@ -10,6 +10,7 @@ type HostState struct {
 	readyAt    time.Time
 	inQueue    bool // true when the host is currently present in HostsQueue
 	inFlight   bool // true while a worker holds an active lease for this host
+	trapWarned bool
 }
 
 // HostsQueue implements heap.Interface as a min-heap ordered by HostState.readyAt.
