@@ -1,6 +1,8 @@
 package analyzer
 
 import (
+	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/yaselnik/Search-Engine/internal/domain"
@@ -109,5 +111,94 @@ func BenchmarkRegexpTokenize(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		RegexpTokenize(text)
+	}
+}
+
+func TestUTFTokenize(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		input    string
+		expected []domain.Token
+	}{
+		{
+			name:     "empty string returns empty slice",
+			input:    "",
+			expected: []domain.Token{},
+		},
+		{
+			name:     "only punctuation and spaces returns empty slice",
+			input:    "   ... --- !!! ??? () []   ",
+			expected: []domain.Token{},
+		},
+		{
+			name:  "basic English words with positions and byte offsets",
+			input: "Hello, world!",
+			expected: []domain.Token{
+				{Value: "Hello", Origin: "Hello", Position: 1, Offset: 0, Length: 5},
+				{Value: "world", Origin: "world", Position: 2, Offset: 7, Length: 5},
+			},
+		},
+		{
+			name:  "preserves internal hyphens, dots, underscores, and apostrophes",
+			input: "Using utf-8 in Go-1.22.1 with user_id and don't.",
+			expected: []domain.Token{
+				{Value: "Using", Origin: "Using", Position: 1, Offset: 0, Length: 5},
+				{Value: "utf-8", Origin: "utf-8", Position: 2, Offset: 6, Length: 5},
+				{Value: "in", Origin: "in", Position: 3, Offset: 12, Length: 2},
+				{Value: "Go-1.22.1", Origin: "Go-1.22.1", Position: 4, Offset: 15, Length: 9},
+				{Value: "with", Origin: "with", Position: 5, Offset: 25, Length: 4},
+				{Value: "user_id", Origin: "user_id", Position: 6, Offset: 30, Length: 7},
+				{Value: "and", Origin: "and", Position: 7, Offset: 38, Length: 3},
+				{Value: "don't", Origin: "don't", Position: 8, Offset: 42, Length: 5},
+			},
+		},
+		{
+			name:  "strips leading, trailing, and doubled connectors",
+			input: "-hello- world--test ..v1.0..",
+			expected: []domain.Token{
+				{Value: "hello", Origin: "hello", Position: 1, Offset: 1, Length: 5},
+				{Value: "world", Origin: "world", Position: 2, Offset: 8, Length: 5},
+				{Value: "test", Origin: "test", Position: 3, Offset: 15, Length: 4},
+				{Value: "v1.0", Origin: "v1.0", Position: 4, Offset: 22, Length: 4},
+			},
+		},
+		{
+			name:  "Cyrillic multi-byte UTF-8 offsets and hyphenated words",
+			input: "Привет, Ростов-на-Дону!",
+			expected: []domain.Token{
+				{Value: "Привет", Origin: "Привет", Position: 1, Offset: 0, Length: 12},
+				{Value: "Ростов-на-Дону", Origin: "Ростов-на-Дону", Position: 2, Offset: 14, Length: 26},
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := UTFTokenize(tc.input)
+			if !reflect.DeepEqual(got, tc.expected) {
+				t.Errorf("UTFTokenize(%q)\ngot:  %+v\nwant: %+v", tc.input, got, tc.expected)
+			}
+
+			// Verify that every token's Offset and Length slice back to its exact Origin substring.
+			for _, tok := range got {
+				sliced := tc.input[tok.Offset : uint32(tok.Offset)+uint32(tok.Length)]
+				if sliced != tok.Origin {
+					t.Errorf("byte offset mismatch: input[%d:%d] = %q, want %q",
+						tok.Offset, uint32(tok.Offset)+uint32(tok.Length), sliced, tok.Origin)
+				}
+			}
+		})
+	}
+}
+
+func BenchmarkUTFTokenize(b *testing.B) {
+	sample := strings.Repeat("Разработка поискового движка на Go-1.22 с поддержкой UTF-8 и BM25F ранжирования. ", 50)
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	for i := 0; i < b.N; i++ {
+		_ = UTFTokenize(sample)
 	}
 }
