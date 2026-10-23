@@ -1,4 +1,4 @@
-package postgresStorage
+package storage
 
 import (
 	"context"
@@ -113,6 +113,40 @@ func (s *PostgresStorage) GetDocumentByID(ctx context.Context, id domain.DocID) 
 	}
 	doc.ID = domain.DocID(uint64(rawID))
 	return doc, nil
+}
+
+// GetDocumentsByIDs retrieves a batch of documents by their IDs in a single query.
+func (s *PostgresStorage) GetDocumentsByIDs(ctx context.Context, ids []domain.DocID) (map[domain.DocID]domain.Document, error) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+
+	rawIDs := make([]int64, len(ids))
+	for i, id := range ids {
+		rawIDs[i] = int64(id)
+	}
+
+	const query = `
+		SELECT id, url, title, content, language, created_at, updated_at
+		FROM documents
+		WHERE id = ANY($1)`
+
+	rows, err := s.pool.Query(ctx, query, rawIDs)
+	if err != nil {
+		return nil, fmt.Errorf("storage: get documents by ids: %w", err)
+	}
+	defer rows.Close()
+
+	docs, err := scanDocuments(rows)
+	if err != nil {
+		return nil, err
+	}
+
+	result := make(map[domain.DocID]domain.Document, len(docs))
+	for _, doc := range docs {
+		result[doc.ID] = doc
+	}
+	return result, nil
 }
 
 // GetAll retrieves all documents from the database.
