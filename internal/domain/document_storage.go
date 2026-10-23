@@ -10,10 +10,10 @@ type DocumentStorage interface {
 	// Count returns the total number of documents currently stored.
 	Count(ctx context.Context) (int64, error)
 
-	// GetDocumentByID retrieves a single document by its ID.
-	GetDocumentByID(ctx context.Context, id DocID) (Document, error)
+	// GetDocumentByIDs retrieves a batch documents by their IDs.
+	GetDocumentsByIDs(ctx context.Context, ids []DocID) (map[DocID]Document, error)
 
-	// GetAll returns all stored documents (primarily for small in-memory datasets and tests).
+	// GetAll returns all stored documents.
 	GetAll(ctx context.Context) ([]Document, error)
 
 	// GetUnindexed retrieves up to limit documents that have not yet been indexed
