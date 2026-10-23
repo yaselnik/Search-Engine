@@ -151,7 +151,7 @@ func main() {
 	)
 
 	urlFilter := urlfilter.NewFilter()
-	crFetcher := fetcher.NewFetcher(nil, "SearchEngineBot/0.1")
+	crFetcher := fetcher.NewFetcher(nil, "Polzun/1.0")
 	crParser := parserHTML.NewParser()
 	crFrontier := frontier.NewFrontier(ctx, 0, logger, frontierOpts...)
 	defer crFrontier.Close()
