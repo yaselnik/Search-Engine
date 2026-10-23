@@ -80,7 +80,7 @@ func (h *Handler) GetDocument(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	doc, err := h.storage.GetDocumentByID(r.Context(), domain.DocID(idUint))
+	doc, err := h.storage.GetDocumentsByIDs(r.Context(), []domain.DocID{domain.DocID(idUint)})
 	if err != nil {
 		if errors.Is(err, domain.ErrDocumentNotFound) {
 			h.respondError(w, http.StatusNotFound, "Not Found", "Document not found")
@@ -91,7 +91,7 @@ func (h *Handler) GetDocument(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.respondJSON(w, http.StatusOK, doc)
+	h.respondJSON(w, http.StatusOK, doc[domain.DocID(idUint)])
 }
 
 // --- Utils ---

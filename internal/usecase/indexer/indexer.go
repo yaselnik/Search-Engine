@@ -116,15 +116,17 @@ func (i *Indexer) IndexNew(ctx context.Context) (int, error) {
 	return totalIndexed, nil
 }
 
-// IndexDocument tokenizes a single document's title and content and adds them to the index.
+// IndexDocument tokenizes a single document's title and content separately
+// and adds them to the inverted index, preserving exact byte offsets for content snippets.
 func (i *Indexer) IndexDocument(_ context.Context, doc domain.Document) error {
-	text := doc.Content
+	var titleTokens []domain.Token
 	if doc.Title != "" && !strings.EqualFold(doc.Title, doc.URL) {
-		text = doc.Title + " " + doc.Content
+		titleTokens = i.analyzer.Analyze(doc.Title)
 	}
 
-	tokens := i.analyzer.Analyze(text)
-	if err := i.index.Add(doc.ID, tokens); err != nil {
+	contentTokens := i.analyzer.Analyze(doc.Content)
+
+	if err := i.index.Add(doc.ID, titleTokens, contentTokens); err != nil {
 		return fmt.Errorf("indexer: add tokens to index for doc %d: %w", doc.ID, err)
 	}
 

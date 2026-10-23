@@ -32,22 +32,28 @@ func (p *Parser) Parse(ctx context.Context, page *domain.FetchedPage) (*domain.P
 	}
 
 	ext := &extractor{
-		baseURL: page.FinalURL,
+		baseURL:      page.FinalURL,
+		lastWasSpace: true,
 	}
 	if ext.baseURL == "" {
 		ext.baseURL = page.URL
 	}
 
-	ext.walk(doc, false)
+	ext.walk(doc, false, false)
+
+	title := ext.title
+	if title == "" {
+		title = ext.firstH1
+	}
 
 	var links []string
 	if !ext.noFollow && len(ext.rawLinks) > 0 {
-		links = resolveBaseIfNeeded(page.FinalURL, ext.baseHref, ext.rawLinks)
+		links = resolveBaseIfNeeded(ext.baseURL, ext.baseHref, ext.rawLinks)
 	}
 
 	return &domain.ParsedPage{
 		URL:      page.URL,
-		Title:    ext.title,
+		Title:    title,
 		Text:     strings.TrimSpace(ext.textBuilder.String()),
 		Links:    links,
 		Language: ext.lang,
@@ -56,30 +62,46 @@ func (p *Parser) Parse(ctx context.Context, page *domain.FetchedPage) (*domain.P
 }
 
 type extractor struct {
-	baseURL     string
-	baseHref    string
-	title       string
-	lang        string
-	noIndex     bool
-	noFollow    bool
-	rawLinks    []string
-	textBuilder strings.Builder
+	baseURL      string
+	baseHref     string
+	title        string
+	firstH1      string
+	lang         string
+	noIndex      bool
+	noFollow     bool
+	rawLinks     []string
+	textBuilder  strings.Builder
+	lastWasSpace bool
 }
 
-func (e *extractor) walk(n *html.Node, skipText bool) {
+func (e *extractor) walk(n *html.Node, skipText bool, inArticleOrMain bool) {
+	isBlock := false
+
 	if n.Type == html.ElementNode {
-		switch n.Data {
+		tag := n.Data
+		isBlock = isBlockElement(tag)
+		if isBlock {
+			e.ensureSpace()
+		}
+
+		switch tag {
 		case "html":
 			if e.lang == "" {
 				if lang := getAttr(n, "lang"); lang != "" {
 					e.lang = normalizeLang(lang)
 				}
 			}
+		case "article", "main":
+			inArticleOrMain = true
 		case "title":
-			if e.title == "" && n.FirstChild != nil && n.FirstChild.Type == html.TextNode {
-				e.title = collapseWhitespace(n.FirstChild.Data)
+			if e.title == "" {
+				e.title = extractNodeText(n)
 			}
 			return
+		case "h1":
+			if e.firstH1 == "" {
+				e.firstH1 = extractNodeText(n)
+			}
 		case "base":
 			if e.baseHref == "" {
 				if href := strings.TrimSpace(getAttr(n, "href")); href != "" {
@@ -101,23 +123,52 @@ func (e *extractor) walk(n *html.Node, skipText bool) {
 		case "script", "style", "noscript", "svg", "canvas", "template", "iframe", "object", "embed", "head":
 			// Never extract visible text from these subtrees, except we must still walk <head>
 			// to find <title>, <base>, and <meta>.
-			if n.Data != "head" {
+			if tag != "head" {
 				return
 			}
 			skipText = true
-		case "nav", "footer", "header", "aside":
+		case "nav", "footer", "aside":
 			// Do not include navigation/boilerplate text in the search index,
-			// but continue walking children so outgoing <a href> links are still discovered!
+			// but continue walking children so outgoing <a href> links are still discovered.
 			skipText = true
+		case "header":
+			// Skip page-level <header> boilerplate, but preserve <header> inside <article> or <main>
+			// because semantic HTML5 articles often place their <h1> and lead text inside <header>.
+			if !inArticleOrMain {
+				skipText = true
+			}
 		}
 	}
 
 	if n.Type == html.TextNode && !skipText {
-		appendCleanText(&e.textBuilder, n.Data)
+		e.appendCleanText(n.Data)
 	}
 
 	for c := n.FirstChild; c != nil; c = c.NextSibling {
-		e.walk(c, skipText)
+		e.walk(c, skipText, inArticleOrMain)
+	}
+
+	if isBlock {
+		e.ensureSpace()
+	}
+}
+
+func (e *extractor) ensureSpace() {
+	if !e.lastWasSpace && e.textBuilder.Len() > 0 {
+		e.textBuilder.WriteByte(' ')
+		e.lastWasSpace = true
+	}
+}
+
+// appendCleanText appends s to textBuilder while collapsing all whitespace sequences into a single space.
+func (e *extractor) appendCleanText(s string) {
+	for _, r := range s {
+		if unicode.IsSpace(r) {
+			e.ensureSpace()
+		} else {
+			e.textBuilder.WriteRune(r)
+			e.lastWasSpace = false
+		}
 	}
 }
 
@@ -141,6 +192,45 @@ func (e *extractor) handleMeta(n *html.Node) {
 			e.lang = normalizeLang(content)
 		}
 	}
+}
+
+// isBlockElement returns true for HTML elements that visually separate words in rendered documents.
+func isBlockElement(tag string) bool {
+	switch tag {
+	case "p", "div", "br", "hr", "li", "ul", "ol", "dl", "dt", "dd",
+		"h1", "h2", "h3", "h4", "h5", "h6",
+		"table", "tr", "td", "th", "thead", "tbody", "tfoot",
+		"blockquote", "pre", "section", "article", "main", "figure", "figcaption", "form":
+		return true
+	}
+	return false
+}
+
+// extractNodeText recursively collects and normalizes all text nodes inside an element.
+func extractNodeText(n *html.Node) string {
+	var sb strings.Builder
+	lastSpace := true
+	var collect func(*html.Node)
+	collect = func(curr *html.Node) {
+		if curr.Type == html.TextNode {
+			for _, r := range curr.Data {
+				if unicode.IsSpace(r) {
+					if !lastSpace && sb.Len() > 0 {
+						sb.WriteByte(' ')
+						lastSpace = true
+					}
+				} else {
+					sb.WriteRune(r)
+					lastSpace = false
+				}
+			}
+		}
+		for c := curr.FirstChild; c != nil; c = c.NextSibling {
+			collect(c)
+		}
+	}
+	collect(n)
+	return strings.TrimSpace(sb.String())
 }
 
 func getAttr(n *html.Node, key string) string {
@@ -178,28 +268,6 @@ func normalizeLang(raw string) string {
 		return raw
 	}
 	return ""
-}
-
-// appendCleanText appends s to sb while collapsing all whitespace sequences into a single space.
-func appendCleanText(sb *strings.Builder, s string) {
-	inSpace := sb.Len() == 0 || strings.HasSuffix(sb.String(), " ")
-	for _, r := range s {
-		if unicode.IsSpace(r) {
-			if !inSpace {
-				sb.WriteByte(' ')
-				inSpace = true
-			}
-		} else {
-			sb.WriteRune(r)
-			inSpace = false
-		}
-	}
-}
-
-func collapseWhitespace(s string) string {
-	var sb strings.Builder
-	appendCleanText(&sb, s)
-	return strings.TrimSpace(sb.String())
 }
 
 // resolveBaseIfNeeded rebases raw links only when the HTML page explicitly declares a <base href> tag.

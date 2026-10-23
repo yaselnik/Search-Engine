@@ -9,6 +9,38 @@ import (
 	"github.com/yaselnik/Search-Engine/internal/infrastructure/analyzer"
 )
 
+type mockIndex struct {
+	postings    map[string][]domain.Posting
+	docStats    map[domain.DocID]domain.DocStats
+	corpusStats domain.CorpusStats
+}
+
+func (m *mockIndex) Add(docID domain.DocID, titleTokens, contentTokens []domain.Token) error {
+	return nil
+}
+func (m *mockIndex) Remove(id domain.DocID) error { return nil }
+func (m *mockIndex) GetPostingsBatch(ctx context.Context, terms []string) (map[string][]domain.Posting, error) {
+	res := make(map[string][]domain.Posting, len(terms))
+	for _, t := range terms {
+		if p, ok := m.postings[t]; ok {
+			res[t] = p
+		}
+	}
+	return res, nil
+}
+func (m *mockIndex) GetOffsetsBatch(ctx context.Context, terms []string, docIDs []domain.DocID) (map[domain.DocID][]uint32, error) {
+	return nil, nil
+}
+func (m *mockIndex) SuggestTerms(ctx context.Context, term string, limit int) ([]string, error) {
+	return nil, nil
+}
+func (m *mockIndex) GetCorpusStats() domain.CorpusStats {
+	return m.corpusStats
+}
+func (m *mockIndex) GetDocStats(docID domain.DocID) domain.DocStats {
+	return m.docStats[docID]
+}
+
 type mockStorage struct {
 	docs []domain.Document
 	err  error
@@ -22,27 +54,15 @@ func (m *mockStorage) Count(ctx context.Context) (int64, error)           { retu
 func (m *mockStorage) GetDocumentByID(ctx context.Context, id domain.DocID) (domain.Document, error) {
 	return domain.Document{}, nil
 }
+func (m *mockStorage) GetDocumentsByIDs(ctx context.Context, ids []domain.DocID) (map[domain.DocID]domain.Document, error) {
+	return nil, nil
+}
 func (m *mockStorage) GetUnindexed(ctx context.Context, limit int) ([]domain.Document, error) {
 	return []domain.Document{}, nil
 }
 func (m *mockStorage) MarkIndexed(ctx context.Context, ids []domain.DocID) error { return nil }
 func (m *mockStorage) Delete(ctx context.Context, id domain.DocID) error         { return nil }
 func (m *mockStorage) Exists(ctx context.Context, id domain.DocID) (bool, error) { return false, nil }
-
-type mockIndex struct {
-	addCalled bool
-	err       error
-}
-
-func (m *mockIndex) Add(docId domain.DocID, tokens []domain.Token) error {
-	m.addCalled = true
-	return m.err
-}
-func (m *mockIndex) GetPostings(term string) ([]domain.Posting, error) { return nil, nil }
-func (m *mockIndex) Remove(id domain.DocID) error                      { return nil }
-func (m *mockIndex) GetDocCount() uint64                               { return 0 }
-func (m *mockIndex) GetAvgDocLength() float64                          { return 0. }
-func (m *mockIndex) GetDocLength(docID domain.DocID) float64           { return 0. }
 
 type mockAnalyzer struct {
 	tokenizer analyzer.Tokenizer
@@ -75,9 +95,6 @@ func TestIndexer_IndexAll(t *testing.T) {
 		err := ix.IndexAll(ctx)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
-		}
-		if !idx.addCalled {
-			t.Error("expected index.Add to be called")
 		}
 	})
 

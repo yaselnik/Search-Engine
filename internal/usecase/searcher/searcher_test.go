@@ -10,16 +10,36 @@ import (
 )
 
 type mockIndex struct {
-	postings map[string][]domain.Posting
-	docLens  map[domain.DocID]float64
+	postings    map[string][]domain.Posting
+	docStats    map[domain.DocID]domain.DocStats
+	corpusStats domain.CorpusStats
 }
 
-func (m *mockIndex) Add(docId domain.DocID, tokens []domain.Token) error { return nil }
-func (m *mockIndex) GetPostings(term string) ([]domain.Posting, error)   { return m.postings[term], nil }
-func (m *mockIndex) Remove(id domain.DocID) error                        { return nil }
-func (m *mockIndex) GetDocCount() uint64                                 { return 2 }
-func (m *mockIndex) GetAvgDocLength() float64                            { return 10.0 }
-func (m *mockIndex) GetDocLength(docID domain.DocID) float64             { return m.docLens[docID] }
+func (m *mockIndex) Add(docID domain.DocID, titleTokens, contentTokens []domain.Token) error {
+	return nil
+}
+func (m *mockIndex) Remove(id domain.DocID) error { return nil }
+func (m *mockIndex) GetPostingsBatch(ctx context.Context, terms []string) (map[string][]domain.Posting, error) {
+	res := make(map[string][]domain.Posting, len(terms))
+	for _, t := range terms {
+		if p, ok := m.postings[t]; ok {
+			res[t] = p
+		}
+	}
+	return res, nil
+}
+func (m *mockIndex) GetOffsetsBatch(ctx context.Context, terms []string, docIDs []domain.DocID) (map[domain.DocID][]uint32, error) {
+	return nil, nil
+}
+func (m *mockIndex) SuggestTerms(ctx context.Context, term string, limit int) ([]string, error) {
+	return nil, nil
+}
+func (m *mockIndex) GetCorpusStats() domain.CorpusStats {
+	return m.corpusStats
+}
+func (m *mockIndex) GetDocStats(docID domain.DocID) domain.DocStats {
+	return m.docStats[docID]
+}
 
 type mockStorage struct {
 	docs map[domain.DocID]domain.Document
@@ -27,8 +47,14 @@ type mockStorage struct {
 
 func (m *mockStorage) Add(ctx context.Context, doc domain.Document) error { return nil }
 func (m *mockStorage) Count(ctx context.Context) (int64, error)           { return 0, nil }
-func (m *mockStorage) GetDocumentByID(ctx context.Context, id domain.DocID) (domain.Document, error) {
-	return m.docs[id], nil
+func (m *mockStorage) GetDocumentsByIDs(ctx context.Context, ids []domain.DocID) (map[domain.DocID]domain.Document, error) {
+	res := make(map[domain.DocID]domain.Document, len(ids))
+	for _, id := range ids {
+		if doc, ok := m.docs[id]; ok {
+			res[id] = doc
+		}
+	}
+	return res, nil
 }
 func (m *mockStorage) GetUnindexed(ctx context.Context, limit int) ([]domain.Document, error) {
 	return []domain.Document{}, nil
@@ -54,13 +80,17 @@ func TestSearcher_Search(t *testing.T) {
 	idx := &mockIndex{
 		postings: map[string][]domain.Posting{
 			"golang": {
-				{DocID: 1, Frequency: 3, Positions: []uint32{1, 5, 10}},
-				{DocID: 2, Frequency: 1, Positions: []uint32{2}},
+				{DocID: 1, ContentFrequency: 3, ContentPositions: []uint32{1, 5, 10}},
+				{DocID: 2, ContentFrequency: 1, ContentPositions: []uint32{2}},
 			},
 		},
-		docLens: map[domain.DocID]float64{
-			1: 10.0,
-			2: 20.0,
+		docStats: map[domain.DocID]domain.DocStats{
+			1: {ContentLength: 10.0},
+			2: {ContentLength: 20.0},
+		},
+		corpusStats: domain.CorpusStats{
+			TotalDocs:        2,
+			AvgContentLength: 15.0,
 		},
 	}
 
