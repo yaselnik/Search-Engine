@@ -21,11 +21,9 @@ import (
 	"github.com/yaselnik/Search-Engine/internal/infrastructure/crawler/frontier"
 	parserHTML "github.com/yaselnik/Search-Engine/internal/infrastructure/crawler/parser"
 	"github.com/yaselnik/Search-Engine/internal/infrastructure/crawler/urlfilter"
-	"github.com/yaselnik/Search-Engine/internal/infrastructure/index/inmemory"
-	pgIndex "github.com/yaselnik/Search-Engine/internal/infrastructure/index/postgres"
+	"github.com/yaselnik/Search-Engine/internal/infrastructure/index"
 	"github.com/yaselnik/Search-Engine/internal/infrastructure/ranker"
-	memStorage "github.com/yaselnik/Search-Engine/internal/infrastructure/storage/inmemory"
-	pgStorage "github.com/yaselnik/Search-Engine/internal/infrastructure/storage/postgres"
+	"github.com/yaselnik/Search-Engine/internal/infrastructure/storage"
 	"github.com/yaselnik/Search-Engine/internal/usecase/crawler"
 	"github.com/yaselnik/Search-Engine/internal/usecase/indexer"
 	"github.com/yaselnik/Search-Engine/internal/usecase/searcher"
@@ -88,7 +86,6 @@ func main() {
 	logLevel := flag.String("log-level", "info", "log level (debug, info, warn, error)")
 	httpAddr := flag.String("addr", ":8080", "http server address")
 	indexInterval := flag.Duration("index-interval", 2*time.Second, "how often to index new documents")
-	inMemory := flag.Bool("in-memory", false, "use in-memory storage instead of PostgreSQL")
 	frontierDSN := flag.String("frontier-dsn", "postgres://postgres:password@localhost:5432/frontier_db?sslmode=disable", "PostgreSQL DSN for frontier")
 	storageDSN := flag.String("storage-dsn", "postgres://postgres:password@localhost:5433/storage_db?sslmode=disable", "PostgreSQL DSN for document storage")
 	indexDSN := flag.String("index-dsn", "postgres://postgres:password@localhost:5434/index_db?sslmode=disable", "PostgreSQL DSN for inverted index")
@@ -105,7 +102,7 @@ func main() {
 	slog.SetDefault(logger)
 	log.SetOutput(io.Discard)
 
-	logger.Info("starting search engine", "log_level", level.String(), "in_memory", *inMemory)
+	logger.Info("starting search engine", "log_level", level.String())
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
@@ -116,40 +113,42 @@ func main() {
 		frontierOpts []frontier.Option
 	)
 
-	if *inMemory {
-		idx = inmemoryIndex.NewInMemoryIndex()
-		docStorage = memStorage.NewInMemoryStorage()
-	} else {
-		fStore, err := frontier.NewPostgresStore(ctx, *frontierDSN)
-		if err != nil {
-			logger.Error("failed to init frontier postgres store", "error", err)
-			return
-		}
-		defer fStore.Close()
-		frontierOpts = append(frontierOpts, frontier.WithPostgresStore(fStore))
-
-		pStorage, err := pgStorage.NewPostgresStorage(ctx, *storageDSN)
-		if err != nil {
-			logger.Error("failed to init document postgres storage", "error", err)
-			return
-		}
-		defer pStorage.Close()
-		docStorage = pStorage
-
-		pIdx, err := pgIndex.NewPostgresIndex(ctx, *indexDSN)
-		if err != nil {
-			logger.Error("failed to init postgres inverted index", "error", err)
-			return
-		}
-		defer pIdx.Close()
-		idx = pIdx
-
-		logger.Info("connected to PostgreSQL databases (frontier_db, storage_db, index_db)")
+	fStore, err := frontier.NewPostgresStore(ctx, *frontierDSN)
+	if err != nil {
+		logger.Error("failed to init frontier postgres store", "error", err)
+		return
 	}
+	defer fStore.Close()
+	frontierOpts = append(frontierOpts, frontier.WithPostgresStore(fStore))
 
-	engStemmer := stemmer.NewEngStemmer()
-	multiStemmer := stemmer.NewMultiLanguageStemmer(engStemmer, stemmer.NoopStemmer{})
-	textAnalyzer := analyzer.NewAnalyzer(analyzer.RegexpTokenize, analyzer.LowercaseFilter{}, multiStemmer)
+	pStorage, err := storage.NewPostgresStorage(ctx, *storageDSN)
+	if err != nil {
+		logger.Error("failed to init document postgres storage", "error", err)
+		return
+	}
+	defer pStorage.Close()
+	docStorage = pStorage
+
+	pIdx, err := index.NewPostgresIndex(ctx, *indexDSN)
+	if err != nil {
+		logger.Error("failed to init postgres inverted index", "error", err)
+		return
+	}
+	defer pIdx.Close()
+	idx = pIdx
+
+	logger.Info("connected to PostgreSQL databases (frontier_db, storage_db, index_db)")
+
+	stemFilter := stemmer.NewMultiLanguageStemmer(
+		stemmer.NewEngStemmer(),
+		stemmer.NewRuStemmer(),
+	)
+
+	textAnalyzer := analyzer.NewAnalyzer(
+		analyzer.UTFTokenize,
+		analyzer.LowercaseFilter{},
+		stemFilter,
+	)
 
 	urlFilter := urlfilter.NewFilter()
 	crFetcher := fetcher.NewFetcher(nil, "SearchEngineBot/0.1")
